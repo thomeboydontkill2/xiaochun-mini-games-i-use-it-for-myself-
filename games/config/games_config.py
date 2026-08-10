@@ -48,6 +48,10 @@ BOMB_MAX_TIMER = 45        # 引信最长秒数
 BOMB_PASS_TIME = 20        # 持有者选择传给谁的限时（秒），超时炸弹在手上直接爆炸
 BOMB_MIN_PASSES_FOR_REWARD = 1  # 赌命局至少传递多少次幸存者才有奖励（防两人开局秒爆刷奖励），按人数倍数
 
+# 死斗
+DUEL_ROUND_TIME = 30        # 每轮出拳时限（秒），超时判弃权
+DUEL_MAX_ROUNDS = 7         # 最多多少轮仍未分胜负则流局
+
 # 谁是卧底词库（每对词：平民词, 卧底词）
 UNDERCOVER_WORD_PAIRS = [
     ("苹果", "梨子"),

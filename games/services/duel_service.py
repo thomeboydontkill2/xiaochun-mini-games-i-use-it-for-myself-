@@ -14,7 +14,7 @@
 import logging
 from src.chat.features.games.config.games_config import (
     LIFE_GAMBLE_MUTE_MINUTES, LIFE_GAMBLE_DOUBLE_MUTE_MINUTES,
-    LIFE_GAMBLE_BRAVE_MULTIPLIER,
+    LIFE_GAMBLE_BRAVE_MULTIPLIER, DUEL_ROUND_TIME, DUEL_MAX_ROUNDS,
 )
 from src.chat.features.games.services import betting
 from src.chat.features.games.services.registry import GameRegistry
@@ -42,6 +42,8 @@ class DuelGame:
         self.p2_choice: str | None = None
         self.history: list[tuple[int, str, str]] = []
         self.settled = False
+        self.p1_timed_out: bool = False   # 单轮超时标记
+        self.p2_timed_out: bool = False
 
 
 class DuelService:
@@ -97,6 +99,10 @@ class DuelService:
         if c1 == c2:
             result = {"round": game.round, "tie": True, "c1": c1, "c2": c2,
                       "p1_score": game.p1_score, "p2_score": game.p2_score}
+            # 7 轮上限：仍未分胜负 → 流局
+            if game.round >= DUEL_MAX_ROUNDS:
+                self._cleanup(game)
+                return {"round_result": result, "game_over": True, "draw": True}
             return {"round_result": result, "game_over": False}
 
         if WIN_MAP[c1] == c2:
@@ -124,6 +130,59 @@ class DuelService:
     def _cleanup(self, game: DuelGame):
         self._active_games.pop(game.p1_id)
         self._active_games.pop(game.p2_id)
+
+    def timeout_round(self, user_id: int) -> dict:
+        """单轮某方超时未出拳。
+        - 双方都超时 → 取消对局（流局）
+        - 单方超时 → 另一方判赢本轮
+        """
+        game = self._active_games.get(user_id)
+        if not game:
+            return {"error": "没有进行中的死斗"}
+        if user_id == game.p1_id:
+            game.p1_timed_out = True
+        elif user_id == game.p2_id:
+            game.p2_timed_out = True
+        else:
+            return {"error": "你不在这场死斗里"}
+
+        # 双方都超时 → 取消
+        if game.p1_timed_out and game.p2_timed_out:
+            self._cleanup(game)
+            return {"both_timeout": True}
+
+        # 单方超时 → 另一方判赢本轮
+        if game.p1_timed_out and not game.p2_timed_out and game.p2_choice is None:
+            # p1 超时，p2 还没出 → p2 赢本轮
+            game.p2_score += 1
+            game.p1_timed_out = False
+            game.p2_timed_out = False
+            result = {"round": game.round, "timeout_win": True,
+                      "winner_id": game.p2_id, "loser_id": game.p1_id,
+                      "p1_score": game.p1_score, "p2_score": game.p2_score}
+            if game.p2_score >= 2:
+                self._cleanup(game)
+                return {"round_result": result, "game_over": True,
+                        "winner_id": game.p2_id, "loser_id": game.p1_id}
+            game.round += 1
+            return {"round_result": result, "game_over": False}
+
+        if game.p2_timed_out and not game.p1_timed_out and game.p1_choice is None:
+            # p2 超时，p1 还没出 → p1 赢本轮
+            game.p1_score += 1
+            game.p1_timed_out = False
+            game.p2_timed_out = False
+            result = {"round": game.round, "timeout_win": True,
+                      "winner_id": game.p1_id, "loser_id": game.p2_id,
+                      "p1_score": game.p1_score, "p2_score": game.p2_score}
+            if game.p1_score >= 2:
+                self._cleanup(game)
+                return {"round_result": result, "game_over": True,
+                        "winner_id": game.p1_id, "loser_id": game.p2_id}
+            game.round += 1
+            return {"round_result": result, "game_over": False}
+
+        return {"waiting_other": True}
 
     def cancel_game(self, user_id: int) -> bool:
         game = self._active_games.get(user_id)

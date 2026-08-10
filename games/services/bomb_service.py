@@ -67,6 +67,8 @@ class BombGame:
         self.started: bool = False
         self.pass_count: int = 0
         self.start_time: float = 0.0
+        self.message_token: int = 0        # 每次传递递增，作废旧按钮
+        self.holder_since: float = 0.0     # 持有者拿到炸弹的时刻，防手快
 
 
 class BombService:
@@ -114,20 +116,55 @@ class BombService:
         game.holder_id = random.choice(game.players)
         game.timer = random.randint(BOMB_MIN_TIMER, BOMB_MAX_TIMER)
         game.start_time = time.time()
+        game.holder_since = time.time()
+        game.message_token = 0
         return True, "游戏开始", game
 
-    def pass_targets(self, game: BombGame) -> list[int]:
-        """当前持有者可选的传递目标：除自己外的所有玩家。"""
-        return [p for p in game.players if p != game.holder_id]
+    def pass_targets(self, game: BombGame, guild=None) -> list[int]:
+        """当前持有者可选的传递目标：除自己外的存活玩家。
+        如果传入 guild，过滤掉已离线/不在频道的成员。"""
+        targets = []
+        for p in game.players:
+            if p == game.holder_id:
+                continue
+            if guild is not None:
+                member = guild.get_member(p)
+                if member is None:
+                    continue  # 不在频道
+            targets.append(p)
+        return targets
 
-    def pass_bomb(self, channel_id: int, from_user: int, target_id: int) -> dict:
+    def reassign_if_holder_invalid(self, game: BombGame, guild) -> bool:
+        """持有者失效（退群/离线）时随机重分配给存活成员。返回是否重分配。"""
+        if guild is None:
+            return False
+        member = guild.get_member(game.holder_id)
+        if member is not None:
+            return False  # 持有者还在
+        alive = [p for p in game.players if guild.get_member(p) is not None]
+        if not alive:
+            return False  # 没人能接
+        game.holder_id = random.choice(alive)
+        game.holder_since = time.time()
+        game.message_token += 1
+        return True
+
+    def pass_bomb(self, channel_id: int, from_user: int, target_id: int,
+                  expected_token: int | None = None) -> dict:
         """持有者把炸弹传给指定目标。
-        返回 {passed, new_holder, message, pass_count} 或 {exploded, ...} 或 {error}。"""
+        返回 {passed, new_holder, message, pass_count} 或 {exploded, ...} 或 {error}。
+        expected_token 用于作废旧按钮（None 则不校验）。"""
         game = self._active_games.get(channel_id)
         if not game or not game.started or game.exploded:
             return {"error": "游戏没在进行中"}
         if game.holder_id != from_user:
             return {"error": "炸弹不在你手上！"}
+        # messageToken 校验：旧 token 的点击一律拒绝
+        if expected_token is not None and expected_token != game.message_token:
+            return {"error": "stale_token"}
+        # 防手快：炸弹刚到手 1 秒内不能传
+        if time.time() - game.holder_since < 1.0:
+            return {"error": "手太快了，稍等一下再传"}
         if target_id == from_user:
             return {"error": "不能传给自己，别耍赖。"}
         if target_id not in game.players:
@@ -136,11 +173,13 @@ class BombService:
         # 每次传递消耗 3-8 秒虚拟引信
         game.timer -= random.randint(3, 8)
         game.pass_count += 1
+        game.message_token += 1
 
         if game.timer <= 0:
             return self._explode(game, exploded_on=from_user)
 
         game.holder_id = target_id
+        game.holder_since = time.time()
         message = random.choice(PASS_MESSAGES).format(
             holder=from_user, next=target_id, count=game.pass_count
         )
@@ -149,6 +188,7 @@ class BombService:
             "new_holder": target_id,
             "message": message,
             "pass_count": game.pass_count,
+            "token": game.message_token,
         }
 
     def timeout_explode(self, channel_id: int, holder_id: int) -> dict:

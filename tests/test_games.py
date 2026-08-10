@@ -92,6 +92,7 @@ def _bomb_with_players(players):
     ok, _, game = svc.start_game(42)
     assert ok
     game.timer = 9999  # 测试传递逻辑时不让它炸
+    game.holder_since = 0  # 绕过防手快
     return svc, game
 
 
@@ -150,6 +151,7 @@ def test_bomb_life_reward_requires_enough_passes(coin, guard):
     svc.add_player(42, 2, True, False)
     ok, _, game = svc.start_game(42)
     game.timer = 1
+    game.holder_since = 0  # 绕过防手快
     holder = game.holder_id
     target = 2 if holder == 1 else 1
     r = svc.pass_bomb(42, holder, target)  # 第1次传递就炸（< 2人*1）
