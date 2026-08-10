@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-谁是卧底 Cog —— /谁是卧底 命令
-改版：描述环节改为公屏按钮触发 Modal（不再用 on_message 监听）
+谁是卧底 Cog —— /谁是卧底 命令。
+
+修复：
+- 人数范围统一从配置读（UNDERCOVER_MIN_PLAYERS / UNDERCOVER_MAX_PLAYERS），
+  不再散落硬编码 4/10。
+- DM 里没有 channel_id 时直接拒绝。
+- 发起人余额不足时给出明确提示。
 """
 
 import discord
@@ -10,7 +15,10 @@ from discord.ext import commands
 import logging
 
 from src.chat.features.games.services.undercover_service import undercover_service
-from src.chat.features.games.config.games_config import DEFAULT_BET
+from src.chat.features.games.services import betting
+from src.chat.features.games.config.games_config import (
+    DEFAULT_BET, UNDERCOVER_MIN_PLAYERS, UNDERCOVER_MAX_PLAYERS,
+)
 from src.chat.features.games.ui.undercover_view import UndercoverJoinView
 
 log = logging.getLogger(__name__)
@@ -23,24 +31,24 @@ class UndercoverCog(commands.Cog):
     @app_commands.command(name="谁是卧底", description="多人谁是卧底！每人发一个词，找出卧底！")
     @app_commands.describe(
         bet="每人下注金额，不填默认 50",
-        min_players="最少几人开始（4-10），不填默认 4",
-        max_players="最多几人加入（4-10），不填默认 10",
+        min_players=f"最少几人开始（{UNDERCOVER_MIN_PLAYERS}-{UNDERCOVER_MAX_PLAYERS}）",
+        max_players=f"最多几人加入（{UNDERCOVER_MIN_PLAYERS}-{UNDERCOVER_MAX_PLAYERS}）",
     )
     async def undercover(
         self,
         interaction: discord.Interaction,
         bet: int = DEFAULT_BET,
-        min_players: int = 4,
-        max_players: int = 10,
+        min_players: int = UNDERCOVER_MIN_PLAYERS,
+        max_players: int = UNDERCOVER_MAX_PLAYERS,
     ):
         channel_id = interaction.channel_id
-
-        # 校验人数范围
-        if min_players < 4 or min_players > 10:
-            await interaction.response.send_message("最少人数必须在 4-10 之间。", ephemeral=True)
+        if channel_id is None or interaction.guild is None:
+            await interaction.response.send_message("这个游戏只能在服务器频道里玩。", ephemeral=True)
             return
-        if max_players < 4 or max_players > 10:
-            await interaction.response.send_message("最多人数必须在 4-10 之间。", ephemeral=True)
+
+        lo, hi = UNDERCOVER_MIN_PLAYERS, UNDERCOVER_MAX_PLAYERS
+        if not (lo <= min_players <= hi) or not (lo <= max_players <= hi):
+            await interaction.response.send_message(f"人数必须在 {lo}-{hi} 之间。", ephemeral=True)
             return
         if min_players > max_players:
             await interaction.response.send_message("最少人数不能大于最多人数。", ephemeral=True)
@@ -55,15 +63,20 @@ class UndercoverCog(commands.Cog):
             await interaction.response.send_message(msg, ephemeral=True)
             return
 
-        game = undercover_service.create_game(channel_id, bet, min_players, max_players)
-
-        # 发起人自动加入
         try:
-            from src.chat.features.odysseia_coin.service.coin_service import coin_service
-            bal = await coin_service.get_balance(interaction.user.id) or 0
+            bal = await betting.get_balance(interaction.user.id)
         except Exception:
+            log.exception("卧底查余额失败")
             bal = 0
         has_coins = bal >= bet
+        if not has_coins:
+            await interaction.response.send_message(
+                f"你只有 {bal} 币，不够下注 {bet}。降低下注，或者开局后用赌命方式加入。",
+                ephemeral=True,
+            )
+            return
+
+        undercover_service.create_game(channel_id, bet, min_players, max_players)
         undercover_service.add_player(channel_id, interaction.user.id, False, has_coins)
 
         view = UndercoverJoinView(channel_id, bet, interaction.user.id)
@@ -76,6 +89,7 @@ class UndercoverCog(commands.Cog):
             f"点击下方按钮加入，发起人点「开始游戏」启动！",
             view=view,
         )
+        view.message = await interaction.original_response()
 
 
 async def setup(bot: commands.Bot):

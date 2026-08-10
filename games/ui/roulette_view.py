@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-幸运轮盘 UI —— Discord 按钮 View
+幸运轮盘 UI —— Discord 按钮 View。
+
+修复：
+- 重复点击不再静默无响应（Discord 会显示"交互失败"），改为 ephemeral 提示。
+- 超时未转 → 取消对局并置灰按钮，玩家不再被"你已经有一个轮盘"卡死。
 """
 
 import discord
@@ -15,6 +19,20 @@ class RouletteView(View):
         self.is_life_gamble = is_life_gamble
         self.has_coins = has_coins
         self.spun = False
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        if self.spun:
+            return
+        from src.chat.features.games.services.roulette_service import roulette_service
+        roulette_service.cancel_game(self.user_id)
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="🎡 轮盘等了你两分钟没等到，先收起来了。币没有变动。", view=self)
+            except discord.HTTPException:
+                pass
 
     @button(label="转动轮盘", style=discord.ButtonStyle.primary, emoji="🎡")
     async def spin_button(self, interaction: discord.Interaction, button: Button):
@@ -22,6 +40,7 @@ class RouletteView(View):
             await interaction.response.send_message("这不是你的轮盘哦。", ephemeral=True)
             return
         if self.spun:
+            await interaction.response.send_message("已经在转了，别催。<鬼脸>", ephemeral=True)
             return
         self.spun = True
         for b in self.children:

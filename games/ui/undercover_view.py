@@ -1,21 +1,96 @@
 # -*- coding: utf-8 -*-
 """
-谁是卧底 UI —— 改版
-描述环节：公屏按钮触发 Modal（只有自己看见的文本输入框）→ 全员提交后统一公屏展示
-投票环节：公屏按钮触发 ephemeral 投票界面（只有自己看见）→ 投完后公屏展示结果
+谁是卧底 UI。
+
+修复：
+- 私信发词失败（对方关了 DM）不再静默吞掉：描述界面与投票界面都有「查看我的词」按钮，全程随时查。
+- 投票超时不再卡死游戏：View 超时自动按已有票强制结算并公屏公告。
+- 招募超时自动取消对局。
+- 平票文案明确说明"不是 bug，本轮无人淘汰，游戏继续"。
 """
 
 import discord
 from discord.ui import View, Select, Button, Modal, TextInput, select, button
 
+from src.chat.features.games.config.games_config import UNDERCOVER_VOTE_TIME, UNDERCOVER_DESC_TIME
+
+
+def _member_name(guild, uid: int) -> str:
+    m = guild.get_member(uid) if guild else None
+    return m.display_name if m else f"<@{uid}>"
+
+
+async def _show_my_word(interaction: discord.Interaction, channel_id: int):
+    """ephemeral 回显自己的词，描述阶段与投票阶段共用。"""
+    from src.chat.features.games.services.undercover_service import undercover_service
+    game = undercover_service.get_game(channel_id)
+    if not game or interaction.user.id not in game.players:
+        await interaction.response.send_message("你不在这场游戏里。", ephemeral=True)
+        return
+    word = game.player_words.get(interaction.user.id, "？")
+    await interaction.response.send_message(f"🤫 你的词是「{word}」。别说出去。", ephemeral=True)
+
+
+async def _announce_tally(channel, guild, channel_id: int, result: dict):
+    """公屏公告一次计票结果（正常投完与超时强制结算共用）。"""
+    from src.chat.features.games.services.undercover_service import undercover_service
+    game = undercover_service.get_game(channel_id)
+
+    vote_lines = [f"{_member_name(guild, tid)}：{cnt} 票" for tid, cnt in result.get("vote_count", {}).items()]
+    text = "🗳️ **投票结束！**\n" + ("\n".join(vote_lines) if vote_lines else "一票都没有……你们在干嘛。")
+    if result.get("forced"):
+        text = "⏰ 投票超时，按已有票数结算。\n" + text
+
+    if result.get("eliminated"):
+        text += f"\n{_member_name(guild, result['eliminated'])} 被淘汰出局。"
+    elif result.get("tie"):
+        text += "\n🤝 平票！这不是 bug——按规则本轮无人淘汰，游戏继续。"
+    else:
+        text += "\n本轮无人淘汰。"
+
+    if result.get("game_over"):
+        names = ", ".join(_member_name(guild, uid) for uid in result["undercover_ids"])
+        if result["winner"] == "civilian":
+            text += f"\n🎉 **平民胜利！** 卧底是：{names}"
+        else:
+            text += f"\n😈 **卧底胜利！** 卧底是：{names}"
+            if result.get("max_rounds_reached"):
+                text += "（轮数用完还没抓出卧底）"
+        if game:
+            settle = await undercover_service.settle(game, result["winner"], guild)
+            if not settle.get("error"):
+                text += "\n结算完成，春春币/禁言已生效。"
+        await channel.send(text)
+    else:
+        next_round = result.get("next_round", 1)
+        text += f"\n\n**第{next_round}轮描述**开始，点下方按钮填写描述 👇"
+        desc_view = UndercoverDescView(channel_id, next_round)
+        desc_view.message = await channel.send(text, view=desc_view)
+
 
 class UndercoverJoinView(View):
     """加入游戏界面"""
+
     def __init__(self, channel_id: int, bet: int, host_id: int):
         super().__init__(timeout=180)
         self.channel_id = channel_id
         self.bet = bet
         self.host_id = host_id
+        self.started = False
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        if self.started:
+            return
+        from src.chat.features.games.services.undercover_service import undercover_service
+        undercover_service.cancel_game(self.channel_id)
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="🎭 招募超时，这局卧底取消了。人齐了再开～", view=self)
+            except discord.HTTPException:
+                pass
 
     @button(label="加入（赌币）", style=discord.ButtonStyle.success, emoji="💰")
     async def join_coin(self, interaction: discord.Interaction, button: Button):
@@ -30,45 +105,55 @@ class UndercoverJoinView(View):
         if interaction.user.id != self.host_id:
             await interaction.response.send_message("只有发起人能开始。", ephemeral=True)
             return
-        from src.chat.features.games.services.undercover_service import undercover_service
+        from src.chat.features.games.services.undercover_service import undercover_service, WORD_DM_MESSAGES
+        import random as _random
         ok, msg, game = undercover_service.start_game(self.channel_id)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True)
             return
+        self.started = True
         for c in self.children:
             c.disabled = True
 
-        # 私信发词（随机开场白，所有人格式一样，卧底自己不知道是卧底）
-        from src.chat.features.games.services.undercover_service import WORD_DM_MESSAGES
-        import random as _random
+        dm_failed: list[int] = []
         for pid in game.players:
             try:
                 member = interaction.guild.get_member(pid)
                 if member:
                     template = _random.choice(WORD_DM_MESSAGES)
-                    msg = template.format(word=game.player_words[pid])
-                    await member.send(f"🎭 {msg}")
+                    await member.send(f"🎭 {template.format(word=game.player_words[pid])}")
+                else:
+                    dm_failed.append(pid)
             except Exception:
-                pass
+                dm_failed.append(pid)
 
-        await interaction.response.edit_message(
-            content=(
-                f"🎭 **谁是卧底开始！**\n"
-                f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
-                f"每人已私信收到自己的词，别直接说出来！\n\n"
-                f"**第{game.current_round}轮描述**\n"
-                f"点下方按钮填写你的描述（只有你能看见的输入框），全员提交后统一展示！"
-            ),
-            view=UndercoverDescView(self.channel_id, game.current_round),
+        content = (
+            f"🎭 **谁是卧底开始！**\n"
+            f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
+            f"每人已私信收到自己的词，别直接说出来！\n"
         )
+        if dm_failed:
+            content += (
+                f"⚠️ {', '.join(f'<@{p}>' for p in dm_failed)} 私信发不出去（可能关了 DM），"
+                f"点下方「查看我的词」偷偷看。\n"
+            )
+        content += (
+            f"\n**第{game.current_round}轮描述**\n"
+            f"点下方按钮填写你的描述（只有你能看见的输入框），全员提交后统一展示！"
+        )
+
+        desc_view = UndercoverDescView(self.channel_id, game.current_round)
+        await interaction.response.edit_message(content=content, view=desc_view)
+        desc_view.message = await interaction.original_response()
 
     async def _join(self, interaction: discord.Interaction, is_life: bool):
         from src.chat.features.games.services.undercover_service import undercover_service
+        from src.chat.features.games.services import betting
+        bal = 0
         try:
-            from src.chat.features.odysseia_coin.service.coin_service import coin_service
-            bal = await coin_service.get_balance(interaction.user.id) or 0
+            bal = await betting.get_balance(interaction.user.id)
         except Exception:
-            bal = 0
+            pass
         has_coins = bal >= self.bet
         if not is_life and not has_coins:
             await interaction.response.send_message(
@@ -87,6 +172,7 @@ class UndercoverJoinView(View):
 
 class UndercoverDescModal(Modal):
     """描述输入弹窗（只有自己看见）"""
+
     def __init__(self, channel_id: int, user_id: int, round_num: int):
         super().__init__(title=f"第{round_num}轮描述你的词", timeout=120)
         self.channel_id = channel_id
@@ -102,43 +188,38 @@ class UndercoverDescModal(Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         from src.chat.features.games.services.undercover_service import undercover_service
-        desc = self.desc_input.value
-        result = undercover_service.submit_desc_anytime(self.channel_id, self.user_id, desc)
+        result = undercover_service.submit_desc_anytime(self.channel_id, self.user_id, self.desc_input.value)
         if "error" in result:
             await interaction.response.send_message(result["error"], ephemeral=True)
             return
 
         if result.get("all_done"):
-            # 全员提交完毕，进入投票
             game = undercover_service.get_game(self.channel_id)
             undercover_service.enter_voting(game)
-            # 公屏统一展示所有描述（显示用户名）
             display = undercover_service.get_descriptions_for_display(game)
             lines = [f"**第{self.round_num}轮描述展示**"]
             for uid, d in display:
-                member = interaction.guild.get_member(uid)
-                name = member.display_name if member else f"<@{uid}>"
-                lines.append(f"**{name}**：{d}")
-            lines.append(f"\n全员已提交！进入投票环节，点下方按钮投票 👇")
-            await interaction.response.send_message(
-                "\n".join(lines),
-                view=UndercoverVoteEntryView(self.channel_id),
-            )
+                lines.append(f"**{_member_name(interaction.guild, uid)}**：{d}")
+            lines.append(f"\n全员已提交！进入投票环节（限时 {UNDERCOVER_VOTE_TIME} 秒），点下方按钮投票 👇")
+            vote_view = UndercoverVoteEntryView(self.channel_id)
+            await interaction.response.send_message("\n".join(lines), view=vote_view)
+            vote_view.message = await interaction.original_response()
         else:
-            count = result["submitted_count"]
-            total = result["total"]
             await interaction.response.send_message(
-                f"✅ 描述已提交（{count}/{total}）。等其他人也填好，小春娘会统一展示。<乖巧>",
+                f"✅ 描述已提交（{result['submitted_count']}/{result['total']}）。"
+                f"等其他人也填好，小春娘会统一展示。<乖巧>",
                 ephemeral=True,
             )
 
 
 class UndercoverDescView(View):
-    """公屏描述按钮：每人点击触发自己的 Modal（只有自己看见）"""
+    """公屏描述按钮：每人点击触发自己的 Modal + 查词按钮"""
+
     def __init__(self, channel_id: int, round_num: int):
-        super().__init__(timeout=180)
+        super().__init__(timeout=max(UNDERCOVER_DESC_TIME * 3, 180))
         self.channel_id = channel_id
         self.round_num = round_num
+        self.message: discord.Message | None = None
 
     @button(label="填写描述", style=discord.ButtonStyle.primary, emoji="✍️")
     async def desc_button(self, interaction: discord.Interaction, button: Button):
@@ -153,17 +234,40 @@ class UndercoverDescView(View):
         if interaction.user.id in game.submitted_this_round:
             await interaction.response.send_message("你本轮已经提交过描述了。", ephemeral=True)
             return
-        # 弹出只有自己能看见的 Modal
         await interaction.response.send_modal(
             UndercoverDescModal(self.channel_id, interaction.user.id, self.round_num)
         )
 
+    @button(label="查看我的词", style=discord.ButtonStyle.secondary, emoji="👀")
+    async def my_word_button(self, interaction: discord.Interaction, button: Button):
+        await _show_my_word(interaction, self.channel_id)
+
 
 class UndercoverVoteEntryView(View):
-    """公屏投票入口按钮：每人点击触发自己的 ephemeral 投票界面"""
+    """公屏投票入口按钮。超时 → 按已有票强制结算。"""
+
     def __init__(self, channel_id: int):
-        super().__init__(timeout=120)
+        super().__init__(timeout=UNDERCOVER_VOTE_TIME)
         self.channel_id = channel_id
+        self.message: discord.Message | None = None
+        self.finished = False
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        from src.chat.features.games.services.undercover_service import undercover_service
+        result = undercover_service.force_tally(self.channel_id)
+        if "error" in result:
+            return
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+                await _announce_tally(self.message.channel, self.message.guild, self.channel_id, result)
+            except discord.HTTPException:
+                pass
 
     @button(label="我要投票", style=discord.ButtonStyle.danger, emoji="🗳️")
     async def vote_button(self, interaction: discord.Interaction, button: Button):
@@ -178,42 +282,42 @@ class UndercoverVoteEntryView(View):
         if interaction.user.id in game.votes:
             await interaction.response.send_message("你已经投过票了。", ephemeral=True)
             return
-        # 构建候选人选项（除自己外的未淘汰玩家）
         candidates = [p for p in game.players if p not in game.eliminated and p != interaction.user.id]
-        options = []
-        for pid in candidates:
-            m = interaction.guild.get_member(pid)
-            name = m.display_name if m else f"<@{pid}>"
-            options.append(discord.SelectOption(label=name, value=str(pid)))
+        options = [
+            discord.SelectOption(label=_member_name(interaction.guild, pid), value=str(pid))
+            for pid in candidates
+        ]
         if not options:
             await interaction.response.send_message("没有可投的候选人。", ephemeral=True)
             return
-        # 触发只有自己能看见的投票界面
-        view = UndercoverVoteView(self.channel_id, interaction.user.id)
+        view = UndercoverVoteView(self.channel_id, interaction.user.id, self)
         view.children[0].options = options
         await interaction.response.send_message(
-            content=f"🗳️ 选择你认为是卧底的人（只有你能看见）<偷笑>",
+            content="🗳️ 选择你认为是卧底的人（只有你能看见）<偷笑>",
             view=view,
             ephemeral=True,
         )
 
+    @button(label="查看我的词", style=discord.ButtonStyle.secondary, emoji="👀")
+    async def my_word_button(self, interaction: discord.Interaction, button: Button):
+        await _show_my_word(interaction, self.channel_id)
+
 
 class UndercoverVoteView(View):
     """投票界面（ephemeral，只有自己看见）"""
-    def __init__(self, channel_id: int, voter_id: int):
-        super().__init__(timeout=60)
+
+    def __init__(self, channel_id: int, voter_id: int, entry_view: UndercoverVoteEntryView):
+        super().__init__(timeout=UNDERCOVER_VOTE_TIME)
         self.channel_id = channel_id
         self.voter_id = voter_id
+        self.entry_view = entry_view
 
-    @select(
-        placeholder="选择你认为是卧底的人...",
-        options=[],
-    )
-    async def vote_select(self, interaction: discord.Interaction, select: Select):
+    @select(placeholder="选择你认为是卧底的人...", options=[])
+    async def vote_select(self, interaction: discord.Interaction, select_: Select):
         if interaction.user.id != self.voter_id:
             await interaction.response.send_message("这不是你的投票。", ephemeral=True)
             return
-        target_id = int(select.values[0])
+        target_id = int(select_.values[0])
         from src.chat.features.games.services.undercover_service import undercover_service
         result = undercover_service.submit_vote(self.channel_id, self.voter_id, target_id)
 
@@ -221,59 +325,17 @@ class UndercoverVoteView(View):
             await interaction.response.send_message(result["error"], ephemeral=True)
             return
 
+        for c in self.children:
+            c.disabled = True
+
         if result.get("vote_done"):
-            # 投票结束，公屏展示结果
-            game = undercover_service.get_game(self.channel_id)
-            eliminated_name = interaction.guild.get_member(result["eliminated"])
-            eliminated_name = eliminated_name.display_name if eliminated_name else f"<@{result['eliminated']}>"
-
-            # 展示票数
-            vote_count = result.get("vote_count", {})
-            vote_lines = []
-            for tid, cnt in vote_count.items():
-                m = interaction.guild.get_member(tid)
-                tname = m.display_name if m else f"<@{tid}>"
-                vote_lines.append(f"{tname}：{cnt} 票")
-            vote_text = "\n".join(vote_lines) if vote_lines else "无票数"
-
-            text = f"🗳️ **投票结束！**\n{vote_text}\n{eliminated_name} 被淘汰出局。\n"
-
-            if result.get("game_over"):
-                winner = result["winner"]
-                undercover_ids = result["undercover_ids"]
-                undercover_names = []
-                for uid in undercover_ids:
-                    m = interaction.guild.get_member(uid)
-                    undercover_names.append(m.display_name if m else f"<@{uid}>")
-
-                if winner == "civilian":
-                    text += f"🎉 **平民胜利！** 卧底是：{', '.join(undercover_names)}\n"
-                else:
-                    text += f"😈 **卧底胜利！** 卧底是：{', '.join(undercover_names)}\n"
-
-                settle = await undercover_service.settle(game, winner, interaction.guild)
-                text += "结算完成，春春币/禁言已生效。"
-            else:
-                text += f"\n**第{result.get('next_round', 1)}轮描述**开始，点下方按钮填写描述 👇"
-
-            for c in self.children:
-                c.disabled = True
+            self.entry_view.finished = True
+            self.entry_view.stop()
             await interaction.response.edit_message(content="✅ 你已投票，等结果公屏展示。", view=self)
-            # 公屏展示结果
-            if result.get("game_over"):
-                await interaction.followup.send(content=text)
-            else:
-                await interaction.followup.send(
-                    content=text,
-                    view=UndercoverDescView(self.channel_id, result.get("next_round", 1)),
-                )
+            await _announce_tally(interaction.channel, interaction.guild, self.channel_id, result)
         else:
-            # 投票已记录，更新进度显示
-            votes_count = result["votes_count"]
-            needed = result["needed"]
-            for c in self.children:
-                c.disabled = True
             await interaction.response.edit_message(
-                content=f"🗳️ 已投票（{votes_count}/{needed}），等其他人投完，结果会公屏展示。<乖巧>",
+                content=f"🗳️ 已投票（{result['votes_count']}/{result['needed']}），"
+                        f"等其他人投完，结果会公屏展示。<乖巧>",
                 view=self,
             )

@@ -1,26 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-传炸弹服务 —— 多人游戏，轮流传递炸弹，随机倒计时爆炸
-炸弹在谁手上爆炸谁输，扣币或禁言
+传炸弹服务 —— 多人游戏，炸弹持有者自行选择传给谁，随机倒计时爆炸。
+
+相比旧版的修复与改动：
+- 【新玩法】传递不再固定顺序轮转：持有者从存活玩家里自选目标（不能传自己）。
+  持有者超时不传（BOMB_PASS_TIME 秒）→ 炸弹当场爆炸。
+- pass_bomb 校验目标合法性，并发点击由持有者校验天然挡掉。
+- 赌命局幸存者奖励要求传递次数 ≥ 人数（BOMB_MIN_PASSES_FOR_REWARD 倍），防止两人开局秒爆刷系统奖励；
+  且奖励走每日限次。
+- 结算失败不再静默：逐人记录成功/失败，返回给 UI 展示。
+- 对局注册表带 TTL。
 """
 
 import random
-import asyncio
 import time
 import logging
 from src.chat.features.games.config.games_config import (
-    MIN_BET, MAX_BET,
-    LIFE_GAMBLE_MUTE_MINUTES, LIFE_GAMBLE_REWARD_MIN, LIFE_GAMBLE_REWARD_MAX,
+    BOMB_MIN_PLAYERS, BOMB_MAX_PLAYERS, BOMB_MIN_TIMER, BOMB_MAX_TIMER,
+    BOMB_MIN_PASSES_FOR_REWARD, LIFE_GAMBLE_MUTE_MINUTES,
 )
+from src.chat.features.games.services import betting
+from src.chat.features.games.services.registry import GameRegistry
 
 log = logging.getLogger(__name__)
 
-MIN_PLAYERS = 2
-MAX_PLAYERS = 8
-MIN_TIMER = 15   # 最短倒计时秒
-MAX_TIMER = 45   # 最长倒计时秒
-
-# 25 个传递文案模板（{holder}=当前持有者，{next}=下一位，{count}=已传递次数）
+# 传递文案模板（{holder}=当前持有者，{next}=下一位，{count}=已传递次数）
 PASS_MESSAGES = [
     "📦 <@{holder}> 收到了一笔特殊快递。\n包裹内容：💣\n签收人：<@{next}>（已传递 {count} 次）",
     "🍲 这锅毛肚快糊了，<@{holder}> 夹不住了！\n筷子伸向：<@{next}>（已传递 {count} 次）",
@@ -33,7 +37,7 @@ PASS_MESSAGES = [
     "📚 这本书借了三年了，<@{holder}> 终于想起来要还。\n下一个受害者：<@{next}>（已传递 {count} 次）",
     "💬 前任发来消息，<@{holder}> 不想回。\n推给兄弟处理：<@{next}>（已传递 {count} 次）",
     "🧋 这杯奶茶烫嘴，<@{holder}> 喝不下去。\n递给：<@{next}>（已传递 {count} 次）",
-    "📱 <@{holder}> 手机响了，来电显示\"鬼\"。\n塞给：<@{next}>（已传递 {count} 次）",
+    "📱 <@{holder}> 手机响了，来电显示“鬼”。\n塞给：<@{next}>（已传递 {count} 次）",
     "🥛 这瓶酸奶过期三天了，<@{holder}> 闻了一下。\n传给：<@{next}>（已传递 {count} 次）",
     "📐 这道积分题不会做，<@{holder}> 看不懂。\n抄给：<@{next}>（已传递 {count} 次）",
     "😳 <@{holder}> 在群里发错消息了，截图被截。\n传给：<@{next}> 当证据（已传递 {count} 次）",
@@ -54,28 +58,23 @@ class BombGame:
     def __init__(self, bet: int, channel_id: int):
         self.bet = bet
         self.channel_id = channel_id
-        self.players: list[int] = []          # 参与者列表
-        self.player_life: dict[int, bool] = {}   # 是否赌命
+        self.players: list[int] = []
+        self.player_life: dict[int, bool] = {}
         self.player_has_coins: dict[int, bool] = {}
-        self.current_holder: int = 0          # 当前持炸弹者的 index
-        self.timer: int = 0                   # 剩余秒数
+        self.holder_id: int = 0            # 当前持炸弹者（user_id，不再用 index）
+        self.timer: int = 0                # 剩余虚拟秒数（引信）
         self.exploded: bool = False
         self.started: bool = False
-        self.passing: bool = False            # 是否正在传递中
-        self.pass_count: int = 0              # 总传递次数
-        self.start_time: float = 0.0          # 游戏开始时间戳
+        self.pass_count: int = 0
+        self.start_time: float = 0.0
 
 
 class BombService:
     def __init__(self):
-        self._active_games: dict[int, BombGame] = {}  # key: channel_id
+        self._active_games: GameRegistry[BombGame] = GameRegistry()
 
     def validate_bet(self, bet: int) -> tuple[bool, str]:
-        if bet < MIN_BET:
-            return False, f"最少下注 {MIN_BET} 币。"
-        if bet > MAX_BET:
-            return False, f"最多下注 {MAX_BET} 币。"
-        return True, ""
+        return betting.validate_bet(bet)
 
     def has_game(self, channel_id: int) -> bool:
         return channel_id in self._active_games
@@ -85,7 +84,7 @@ class BombService:
 
     def create_game(self, channel_id: int, bet: int) -> BombGame:
         game = BombGame(bet, channel_id)
-        self._active_games[channel_id] = game
+        self._active_games.set(channel_id, game)
         return game
 
     def add_player(self, channel_id: int, user_id: int, is_life: bool, has_coins: bool) -> tuple[bool, str]:
@@ -96,8 +95,8 @@ class BombService:
             return False, "游戏已开始，不能加入"
         if user_id in game.players:
             return False, "你已经加入了"
-        if len(game.players) >= MAX_PLAYERS:
-            return False, f"人满了（最多 {MAX_PLAYERS} 人）"
+        if len(game.players) >= BOMB_MAX_PLAYERS:
+            return False, f"人满了（最多 {BOMB_MAX_PLAYERS} 人）"
         game.players.append(user_id)
         game.player_life[user_id] = is_life
         game.player_has_coins[user_id] = has_coins
@@ -107,97 +106,107 @@ class BombService:
         game = self._active_games.get(channel_id)
         if not game:
             return False, "没有炸弹游戏", None
-        if len(game.players) < MIN_PLAYERS:
-            return False, f"至少要 {MIN_PLAYERS} 人才能开始", None
+        if game.started:
+            return False, "游戏已经开始了", None
+        if len(game.players) < BOMB_MIN_PLAYERS:
+            return False, f"至少要 {BOMB_MIN_PLAYERS} 人才能开始", None
         game.started = True
-        game.current_holder = random.randint(0, len(game.players) - 1)
-        game.timer = random.randint(MIN_TIMER, MAX_TIMER)
+        game.holder_id = random.choice(game.players)
+        game.timer = random.randint(BOMB_MIN_TIMER, BOMB_MAX_TIMER)
         game.start_time = time.time()
         return True, "游戏开始", game
 
-    def pass_bomb(self, channel_id: int, from_user: int) -> dict:
-        """传炸弹给下一个人，返回 {passed, new_holder, timer, exploded, message, pass_count, duration}"""
+    def pass_targets(self, game: BombGame) -> list[int]:
+        """当前持有者可选的传递目标：除自己外的所有玩家。"""
+        return [p for p in game.players if p != game.holder_id]
+
+    def pass_bomb(self, channel_id: int, from_user: int, target_id: int) -> dict:
+        """持有者把炸弹传给指定目标。
+        返回 {passed, new_holder, message, pass_count} 或 {exploded, ...} 或 {error}。"""
         game = self._active_games.get(channel_id)
         if not game or not game.started or game.exploded:
             return {"error": "游戏没在进行中"}
-        if game.players[game.current_holder] != from_user:
-            return {"error": "炸弹不在你手上"}
+        if game.holder_id != from_user:
+            return {"error": "炸弹不在你手上！"}
+        if target_id == from_user:
+            return {"error": "不能传给自己，别耍赖。"}
+        if target_id not in game.players:
+            return {"error": "这个人不在游戏里。"}
 
-        # 消耗时间（3-8秒）
-        elapsed = random.randint(3, 8)
-        game.timer -= elapsed
+        # 每次传递消耗 3-8 秒虚拟引信
+        game.timer -= random.randint(3, 8)
         game.pass_count += 1
 
         if game.timer <= 0:
-            # 爆炸
-            game.exploded = True
-            loser_id = game.players[game.current_holder]
-            duration = int(time.time() - game.start_time)
-            self._cleanup(channel_id)
-            return {
-                "exploded": True, "loser_id": loser_id, "game": game,
-                "pass_count": game.pass_count, "duration": duration,
-            }
+            return self._explode(game, exploded_on=from_user)
 
-        # 传给下一个人
-        game.current_holder = (game.current_holder + 1) % len(game.players)
-        new_holder = game.players[game.current_holder]
+        game.holder_id = target_id
         message = random.choice(PASS_MESSAGES).format(
-            holder=from_user, next=new_holder, count=game.pass_count
+            holder=from_user, next=target_id, count=game.pass_count
         )
         return {
             "passed": True,
-            "new_holder": new_holder,
-            "timer": game.timer,
+            "new_holder": target_id,
             "message": message,
             "pass_count": game.pass_count,
         }
 
-    def cancel_game(self, channel_id: int) -> bool:
-        if channel_id in self._active_games:
-            del self._active_games[channel_id]
-            return True
-        return False
+    def timeout_explode(self, channel_id: int, holder_id: int) -> dict:
+        """持有者超时没传：炸弹当场爆炸。UI 的超时回调调用。"""
+        game = self._active_games.get(channel_id)
+        if not game or not game.started or game.exploded:
+            return {"error": "游戏没在进行中"}
+        if game.holder_id != holder_id:
+            return {"error": "持有者已变化"}
+        return self._explode(game, exploded_on=holder_id, timed_out=True)
 
-    def _cleanup(self, channel_id: int):
-        self._active_games.pop(channel_id, None)
+    def _explode(self, game: BombGame, exploded_on: int, timed_out: bool = False) -> dict:
+        game.exploded = True
+        duration = int(time.time() - game.start_time)
+        self._active_games.pop(game.channel_id)
+        return {
+            "exploded": True, "loser_id": exploded_on, "game": game,
+            "pass_count": game.pass_count, "duration": duration, "timed_out": timed_out,
+        }
+
+    def cancel_game(self, channel_id: int) -> bool:
+        return self._active_games.pop(channel_id) is not None
 
     async def settle(self, game: BombGame, loser_id: int, guild=None) -> dict:
-        """结算输家。"""
-        from src.chat.features.odysseia_coin.service.coin_service import coin_service
+        """结算输家与幸存者。"""
         from src.chat.features.abuse_guard.service.abuse_guard_service import abuse_guard_service
 
         loser_life = game.player_life.get(loser_id, False)
-        loser_has_coins = game.player_has_coins.get(loser_id, False)
         bet = game.bet
-
+        survivors = [p for p in game.players if p != loser_id]
         result = {"loser_id": loser_id, "bet": bet}
 
         if loser_life:
-            # 赌命：禁言2分钟，其他人得系统奖励
             await abuse_guard_service.punish_with_mute(loser_id, LIFE_GAMBLE_MUTE_MINUTES, guild)
-            reward = random.randint(LIFE_GAMBLE_REWARD_MIN, LIFE_GAMBLE_REWARD_MAX)
-            for pid in game.players:
-                if pid != loser_id:
-                    try:
-                        await coin_service.add_coins(pid, reward // max(1, len(game.players) - 1), "传炸弹幸存奖励")
-                    except Exception:
-                        log.exception("炸弹幸存奖励失败")
-            return {**result, "mode": "life", "loser_muted": LIFE_GAMBLE_MUTE_MINUTES, "survivor_reward": reward // max(1, len(game.players) - 1)}
-        else:
-            # 赌币：扣币，其他人平分
-            try:
-                await coin_service.remove_coins(loser_id, bet, "传炸弹爆炸")
-            except Exception:
-                log.exception("炸弹扣币失败")
-            survivor_share = bet // max(1, len(game.players) - 1)
-            for pid in game.players:
-                if pid != loser_id:
-                    try:
-                        await coin_service.add_coins(pid, survivor_share, "传炸弹幸存分赃")
-                    except Exception:
-                        log.exception("炸弹分赃失败")
-            return {**result, "mode": "coin", "loser_loss": bet, "survivor_reward": survivor_share, "loser_muted": 0}
+            # 防刷：局太短（传递次数 < 人数 × 系数）不发幸存奖励
+            min_passes = len(game.players) * BOMB_MIN_PASSES_FOR_REWARD
+            survivor_reward = 0
+            if game.pass_count >= min_passes:
+                for pid in survivors:
+                    granted = await betting.grant_life_reward(pid, "传炸弹幸存奖励")
+                    survivor_reward = max(survivor_reward, granted)
+            return {
+                **result, "mode": "life",
+                "loser_muted": LIFE_GAMBLE_MUTE_MINUTES,
+                "survivor_reward": survivor_reward,
+                "reward_skipped": game.pass_count < min_passes,
+            }
+
+        # 赌币：扣输家，幸存者平分；扣款失败则不派彩（防凭空造币）
+        if not await betting.deduct(loser_id, bet, "传炸弹爆炸"):
+            return {**result, "mode": "coin", "settle_failed": True, "loser_loss": 0, "survivor_reward": 0, "loser_muted": 0}
+        survivor_share = bet // max(1, len(survivors))
+        for pid in survivors:
+            await betting.credit(pid, survivor_share, "传炸弹幸存分赃")
+        return {
+            **result, "mode": "coin",
+            "loser_loss": bet, "survivor_reward": survivor_share, "loser_muted": 0,
+        }
 
 
 bomb_service = BombService()
