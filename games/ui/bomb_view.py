@@ -64,11 +64,12 @@ def _explosion_embed(result: dict, settle: dict) -> discord.Embed:
 class BombJoinView(View):
     """加入游戏界面"""
 
-    def __init__(self, channel_id: int, bet: int, host_id: int):
+    def __init__(self, channel_id: int, bet: int, host_id: int, host_life: bool = False):
         super().__init__(timeout=120)
         self.channel_id = channel_id
         self.bet = bet
         self.host_id = host_id
+        self.host_life = host_life
         self.started = False
         self.message: discord.Message | None = None
 
@@ -113,23 +114,14 @@ class BombJoinView(View):
         for c in self.children:
             c.disabled = True
 
-        # 招募消息本身改成静态记录，选人界面单独发一条新消息，和后续每次传递保持同一套体验
-        start_embed = game_embed(
-            title="💣 传炸弹开始！",
-            description=(
-                f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
-                f"炸弹交给了 <@{game.holder_id}>，看下面新消息 👇"
-            ),
-            color=COLOR_PLAYING,
-            footer=f"房间 #{self.channel_id}",
-        )
-        await interaction.response.edit_message(embed=start_embed, content=None, view=None)
+        # 招募消息直接编辑成第一手选人界面，不再发新消息
         pass_view = BombPassView(self.channel_id, game.holder_id, interaction.guild,
                                   bomb_service.pass_targets(game, interaction.guild),
                                   token=game.message_token)
         pass_embed = game_embed(
-            title="💣 拿到炸弹了！",
+            title="💣 传炸弹开始！",
             description=(
+                f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
                 f"<@{game.holder_id}> 拿到炸弹了！\n"
                 f"👉 从下拉菜单选一个人传出去，**{BOMB_PASS_TIME} 秒**不传就在你手上炸！\n"
                 f"⏱️ 引信长度未知……"
@@ -137,10 +129,11 @@ class BombJoinView(View):
             color=COLOR_PLAYING,
             footer=f"持有者 <@{game.holder_id}>",
         )
+        pass_view.message = interaction.message
         try:
-            pass_view.message = await interaction.followup.send(embed=pass_embed, view=pass_view, wait=True)
+            await interaction.response.edit_message(embed=pass_embed, content=None, view=pass_view)
         except Exception:
-            log.exception("传炸弹开局选人界面发送失败，尝试频道直发兜底")
+            log.exception("传炸弹开局编辑消息失败，尝试频道直发兜底")
             channel = interaction.channel
             if channel is not None:
                 try:
@@ -244,31 +237,15 @@ class BombPassView(View):
             await interaction.response.edit_message(embed=_explosion_embed(result, settle), content=None, view=self)
             return
 
-        # 旧消息改成静态记录（去掉可交互组件，防止误点已经作废的按钮）
-        for c in self.children:
-            c.disabled = True
-        passed_embed = game_embed(
-            title="💣 传走了",
-            description=f"{result['message']}\n\n💣 炸弹传走了，看下面新消息 👇",
-            color=COLOR_PLAYING,
-            footer=f"房间 #{self.channel_id}",
-        )
-        await interaction.response.edit_message(embed=passed_embed, content=None, view=self)
-
-        # 新持有者的选人界面单独发一条新消息
+        # 新持有者的选人界面：直接编辑当前消息，不再发新消息
         game = bomb_service.get_game(self.channel_id)
         if game is None:
             log.warning("传炸弹传递后对局已消失（可能已超时/取消），跳过发新界面")
             return
         # 持有者失效重分配
+        reassign_desc = ""
         if bomb_service.reassign_if_holder_invalid(game, interaction.guild):
-            reassign_embed = game_embed(
-                title="⚠️ 持有者重分配",
-                description=f"原持有者已不在场，炸弹随机重分配给了 <@{game.holder_id}>！",
-                color=COLOR_MUTE,
-                footer=f"房间 #{self.channel_id}",
-            )
-            await interaction.followup.send(embed=reassign_embed, wait=True)
+            reassign_desc = f"\n⚠️ 原持有者已不在场，炸弹随机重分配给了 <@{game.holder_id}>！\n"
         next_token = game.message_token
         next_view = BombPassView(self.channel_id, game.holder_id, interaction.guild,
                                  bomb_service.pass_targets(game, interaction.guild),
@@ -276,19 +253,23 @@ class BombPassView(View):
         next_embed = game_embed(
             title="💣 接到炸弹！",
             description=(
-                f"<@{game.holder_id}> 接到炸弹了！\n"
+                f"{result['message']}\n"
+                f"<@{game.holder_id}> 接到炸弹了！{reassign_desc}\n"
                 f"👉 从下拉菜单选一个人传出去，**{BOMB_PASS_TIME} 秒**不传就在你手上炸！⏱️"
             ),
             color=COLOR_PLAYING,
             footer=f"持有者 <@{game.holder_id}>",
         )
+        next_view.message = interaction.message
+        self.done = True
+        self.stop()
         try:
-            next_view.message = await interaction.followup.send(embed=next_embed, view=next_view, wait=True)
+            await interaction.response.edit_message(embed=next_embed, content=None, view=next_view)
         except Exception:
-            log.exception("传炸弹下一手选人界面发送失败，尝试频道直发兜底")
+            log.exception("传炸弹编辑消息成新面板失败，尝试频道直发兜底")
             channel = interaction.channel
             if channel is not None:
                 try:
                     next_view.message = await channel.send(embed=next_embed, view=next_view)
                 except Exception:
-                    log.exception("传炸弹下一手兜底发送也失败，游戏会卡在这里，请管理员介入")
+                    log.exception("传炸弹兜底发送也失败，游戏会卡在这里，请管理员介入")

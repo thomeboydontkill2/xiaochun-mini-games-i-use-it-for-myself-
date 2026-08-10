@@ -69,6 +69,9 @@ class WerewolfGame:
         self.phase: str = "joining"
         self.day: int = 0
 
+        # 赌命模式
+        self.player_life: dict[int, bool] = {}
+
         self.guard_last_target: int | None = None
         self.witch_antidote_used = False
         self.witch_poison_used = False
@@ -168,7 +171,7 @@ class WerewolfService:
     def cancel_game(self, channel_id: int) -> bool:
         return self._active_games.pop(channel_id) is not None
 
-    def add_player(self, channel_id: int, user_id: int) -> tuple[bool, str]:
+    def add_player(self, channel_id: int, user_id: int, is_life: bool = False) -> tuple[bool, str]:
         game = self._active_games.get(channel_id)
         if not game:
             return False, "没有进行中的狼人杀"
@@ -179,6 +182,7 @@ class WerewolfService:
         if len(game.players) >= WEREWOLF_MAX_PLAYERS:
             return False, f"人满了（最多 {WEREWOLF_MAX_PLAYERS} 人）"
         game.players.append(user_id)
+        game.player_life[user_id] = is_life
         return True, f"加入成功（当前 {len(game.players)} 人）"
 
     def leave_player(self, channel_id: int, user_id: int) -> tuple[bool, str]:
@@ -801,7 +805,8 @@ class WerewolfService:
         }
 
     async def settle(self, game: WerewolfGame, winner: str) -> dict:
-        """胜方阵营平分败方下注池。幂等。"""
+        """结算：赌币败方扣局费，赌命败方不扣币。
+        赌币胜方分败方局费池，赌命胜方拿系统奖励（每日限次）。幂等。"""
         if game.settled:
             return {"error": "这局已经结算过了"}
         game.settled = True
@@ -814,22 +819,34 @@ class WerewolfService:
         goods = [p for p in game.players if p not in wolves]
         winners, losers = (goods, wolves) if winner == "good" else (wolves, goods)
 
+        # 赌币败方扣局费，赌命败方不扣
         collected = 0
         failed: list[int] = []
-        for pid in losers:
+        coin_losers = [p for p in losers if not game.player_life.get(p, False)]
+        for pid in coin_losers:
             if await betting.deduct(pid, game.bet, "狼人杀败方局费"):
                 collected += game.bet
             else:
                 failed.append(pid)
 
-        share = collected // len(winners) if winners and collected > 0 else 0
+        # 赌币胜方分池
+        coin_winners = [p for p in winners if not game.player_life.get(p, False)]
+        share = collected // len(coin_winners) if coin_winners and collected > 0 else 0
         if share > 0:
-            for pid in winners:
+            for pid in coin_winners:
                 await betting.credit(pid, share, "狼人杀胜方分池")
+
+        # 赌命胜方拿系统奖励（每日限次）
+        life_winners = [p for p in winners if game.player_life.get(p, False)]
+        life_rewards: dict[int, int] = {}
+        for pid in life_winners:
+            reward = await betting.grant_life_reward(pid, "狼人杀赌命勇敢者奖励")
+            life_rewards[pid] = reward
 
         return {
             "winner": winner, "winners": winners, "losers": losers,
             "pool": collected, "share": share, "deduct_failed": failed,
+            "life_rewards": life_rewards,
         }
 
     def _flush_stats(self, game: WerewolfGame, winner: str) -> None:
