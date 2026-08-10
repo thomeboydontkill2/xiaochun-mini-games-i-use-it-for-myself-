@@ -20,6 +20,7 @@
 """
 
 import logging
+from datetime import timedelta
 
 import discord
 from discord.ui import View, Button, button
@@ -581,7 +582,7 @@ async def _apply_mute(guild, user_id: int, minutes: int):
         member = guild.get_member(user_id)
         if member is None:
             return
-        await member.timeout_for(discord.utils.timedelta(minutes=minutes),
+        await member.timeout(timedelta(minutes=minutes),
                                  reason="加压轮盘中弹")
     except Exception:
         log.exception("加压轮盘禁言失败（检查机器人「超时成员」权限）")
@@ -603,7 +604,7 @@ async def _apply_coward_penalty(guild, user_id: int, minutes: int):
             except Exception:
                 log.warning("加压轮盘改昵称失败（检查机器人「管理昵称」权限）")
         # 禁言
-        await member.timeout_for(discord.utils.timedelta(minutes=minutes),
+        await member.timeout(timedelta(minutes=minutes),
                                  reason="加压轮盘胆小鬼")
     except Exception:
         log.exception("加压轮盘胆小鬼惩罚失败")
