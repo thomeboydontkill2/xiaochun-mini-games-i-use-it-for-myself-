@@ -92,6 +92,10 @@ class WerewolfGame:
         self.campaign: dict = {}             # 竞选过程数据
         self.pending_sheriff_transfer: int | None = None  # 待移交警徽的（已死）警长
 
+        # 统计累加器（开局创建，settle 时落库）
+        self.stats: dict | None = None
+        self.guild_id: int | None = None
+
     # --- 便捷查询 ---
 
     def alive(self) -> list[int]:
@@ -199,6 +203,11 @@ class WerewolfService:
         random.shuffle(roles)
         game.roles = dict(zip(game.players, roles))
         game.day = 1
+        # 创建统计累加器
+        from src.chat.features.games.services.werewolf_stats_recorder import (
+            create_werewolf_stats,
+        )
+        game.stats = create_werewolf_stats(game.players, game.roles)
         self._begin_night(game)
         return True, "游戏开始", game
 
@@ -798,6 +807,9 @@ class WerewolfService:
         game.settled = True
         self._active_games.pop(game.channel_id)
 
+        # 落库统计
+        self._flush_stats(game, winner)
+
         wolves = game.holders(ROLE_WOLF, alive_only=False)
         goods = [p for p in game.players if p not in wolves]
         winners, losers = (goods, wolves) if winner == "good" else (wolves, goods)
@@ -819,6 +831,26 @@ class WerewolfService:
             "winner": winner, "winners": winners, "losers": losers,
             "pool": collected, "share": share, "deduct_failed": failed,
         }
+
+    def _flush_stats(self, game: WerewolfGame, winner: str) -> None:
+        """把内存统计落库。失败只记日志，不影响结算。"""
+        if game.stats is None or not game.guild_id:
+            return
+        try:
+            from src.chat.features.games.services.werewolf_stats_recorder import (
+                finalize_werewolf_stats,
+            )
+            from src.chat.features.games.services.pressure_stats_db import get_stats_db
+            wolves = game.holders(ROLE_WOLF, alive_only=False)
+            goods = [p for p in game.players if p not in wolves]
+            rows = finalize_werewolf_stats(
+                game.stats, winner=winner, wolves=wolves, goods=goods)
+            get_stats_db().record_werewolf_game(game.guild_id, rows)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("狼人杀统计落库失败")
+        finally:
+            game.stats = None
 
 
 werewolf_service = WerewolfService()

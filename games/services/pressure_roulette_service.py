@@ -36,6 +36,11 @@ from src.chat.features.games.config.games_config import (
 )
 from src.chat.features.games.services import betting
 from src.chat.features.games.services.registry import GameRegistry
+from src.chat.features.games.services.pressure_stats_recorder import (
+    create_pressure_stats, record_shot, record_choice, record_elimination,
+    record_quit, record_unload, record_riposte, record_riposte_kill,
+    finalize_pressure_stats,
+)
 
 # 第一枪特殊判定概率（不走弹巢 1/6）
 FIRST_SHOT_HIT_CHANCE = 0.15
@@ -93,6 +98,10 @@ class PressureRouletteGame:
 
         self.settled: bool = False
         self.winner: int | None = None     # None = 平局或未结束
+
+        # 统计累加器（开局创建，settle 时落库）
+        self.stats: dict | None = None
+        self.guild_id: int | None = None   # 用于落库（cog 里设）
 
     # ---- 便捷查询 ----
     def alive(self) -> list[int]:
@@ -278,6 +287,8 @@ class PressureRouletteService:
         game.pressure_bullets = 0
         game.set_charge(None, 0)
         game.turn_token += 1
+        # 创建统计累加器
+        game.stats = create_pressure_stats(game.players)
         return True, "开局", game
 
     # ==================== fire 阶段：扣扳机 / 抽弹 / 退出 ====================
@@ -313,6 +324,13 @@ class PressureRouletteService:
         game.shot_number += 1
         game.turn_token += 1
 
+        # 统计：记一次扣扳机
+        if game.stats is not None:
+            hit_chance = FIRST_SHOT_HIT_CHANCE if first_shot else None
+            record_shot(game.stats, shooter_id,
+                        hit=hit, bullets_before=bullets_before,
+                        unknown_before=unknown_before, hit_chance=hit_chance)
+
         # 抽弹枪一次性标记消费
         unload_shot = game.unload_shot_owner == shooter_id
         if unload_shot:
@@ -329,6 +347,9 @@ class PressureRouletteService:
                 target_idx = alive.index(shooter_id)
                 if hit:
                     game.turn_index = initiator_idx - 1 if initiator_idx > target_idx else initiator_idx
+                    # 统计：反手击杀
+                    if game.stats is not None:
+                        record_riposte_kill(game.stats, initiator_id)
                 else:
                     game.turn_index = initiator_idx
             else:
@@ -379,6 +400,9 @@ class PressureRouletteService:
         game.dead.append(victim_id)
         game.eliminated.append({"user_id": victim_id, "minutes": stake_minutes})
         _release_riposte(game, victim_id)
+        # 统计：中弹淘汰
+        if game.stats is not None:
+            record_elimination(game.stats, victim_id, stake_minutes)
 
         # 子弹打光检查
         if game.bullets <= 0:
@@ -396,6 +420,14 @@ class PressureRouletteService:
             game.turn_index = 0
         game.phase = "fire"
         game.turn_token += 1
+
+        # 统计：记一次选择
+        if game.stats is not None:
+            charge_after = game.charge_for(actor_id) if effective_action == "again" else 0
+            record_choice(game.stats, actor_id,
+                          action=effective_action, loaded_bullets=loaded_bullets,
+                          charge_after=charge_after)
+
         return {
             "action": "shoot", "by": victim_id, "victim": victim_id, "hit": True,
             "shot_count": game.shot_number,
@@ -501,6 +533,9 @@ class PressureRouletteService:
         game.set_charge(user_id, 0)
         game.unload_shot_owner = user_id
         game.turn_token += 1
+        # 统计：抽弹开枪
+        if game.stats is not None:
+            record_unload(game.stats, user_id)
 
         # 立刻扣扳机
         return self._perform_shot(channel_id, user_id)
@@ -533,6 +568,9 @@ class PressureRouletteService:
         game.turn_index = alive.index(target_id)
         game.phase = "fire"
         game.turn_token += 1
+        # 统计：反手还击
+        if game.stats is not None:
+            record_riposte(game.stats, user_id, target_id)
 
         return {
             "action": "riposte", "by": user_id, "target": target_id,
@@ -569,6 +607,9 @@ class PressureRouletteService:
         })
         _release_riposte(game, user_id)
         game.turn_token += 1
+        # 统计：胆小鬼退出
+        if game.stats is not None:
+            record_quit(game.stats, user_id, penalty_minutes)
 
         # 检查是否结束
         alive = game.alive()
@@ -653,11 +694,14 @@ class PressureRouletteService:
     # ==================== 结算 ====================
 
     async def settle(self, game: PressureRouletteGame) -> dict:
-        """结算局费：败方每人扣 bet，胜方平分实际收到的池。平局不结算。"""
+        """结算局费 + 落库统计。败方每人扣 bet，胜方平分实际收到的池。平局不结算。"""
         if game.settled:
             return {"error": "这局已经结算过了。"}
         game.settled = True
         self._active_games.pop(game.channel_id)
+
+        # 落库统计
+        self._flush_stats(game)
 
         if game.winner is None:
             return {"winner": None, "pool": 0, "share": 0, "deduct_failed": []}
@@ -686,6 +730,22 @@ class PressureRouletteService:
             "share": share,
             "deduct_failed": failed,
         }
+
+    def _flush_stats(self, game: PressureRouletteGame) -> None:
+        """把内存统计落库。失败只记日志，不影响结算。"""
+        if game.stats is None or not game.guild_id:
+            return
+        try:
+            from src.chat.features.games.services.pressure_stats_db import get_stats_db
+            alive_ids = game.alive()
+            outcome = "champion" if game.winner is not None else "draw"
+            rows = finalize_pressure_stats(game.stats, outcome=outcome, alive_ids=alive_ids)
+            get_stats_db().record_pressure_game(game.guild_id, rows)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("加压轮盘统计落库失败")
+        finally:
+            game.stats = None
 
 
 pressure_roulette_service = PressureRouletteService()
