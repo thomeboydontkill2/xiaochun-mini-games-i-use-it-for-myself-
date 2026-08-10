@@ -421,13 +421,6 @@ class PressureRouletteService:
         game.phase = "fire"
         game.turn_token += 1
 
-        # 统计：记一次选择
-        if game.stats is not None:
-            charge_after = game.charge_for(actor_id) if effective_action == "again" else 0
-            record_choice(game.stats, actor_id,
-                          action=effective_action, loaded_bullets=loaded_bullets,
-                          charge_after=charge_after)
-
         return {
             "action": "shoot", "by": victim_id, "victim": victim_id, "hit": True,
             "shot_count": game.shot_number,
