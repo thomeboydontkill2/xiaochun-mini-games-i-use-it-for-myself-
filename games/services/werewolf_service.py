@@ -35,6 +35,7 @@ from src.chat.features.games.config.games_config import (
     WEREWOLF_GUARD_SAME_TARGET_TWICE, WEREWOLF_GUARD_CAN_PROTECT_SELF,
     WEREWOLF_SAVE_AND_GUARD_KILLS, WEREWOLF_TIE_ELIMINATES_NOBODY,
     WEREWOLF_IDIOT_KEEPS_VOTE, WEREWOLF_ELECT_SHERIFF, WEREWOLF_SHERIFF_VOTE_WEIGHT,
+    LIFE_GAMBLE_MUTE_MINUTES,
 )
 from src.chat.features.games.services import betting
 from src.chat.features.games.services.registry import GameRegistry
@@ -804,8 +805,8 @@ class WerewolfService:
             **extra,
         }
 
-    async def settle(self, game: WerewolfGame, winner: str) -> dict:
-        """结算：赌币败方扣局费，赌命败方不扣币。
+    async def settle(self, game: WerewolfGame, winner: str, guild=None) -> dict:
+        """结算：赌币败方扣局费，赌命败方禁言不扣币。
         赌币胜方分败方局费池，赌命胜方拿系统奖励（每日限次）。幂等。"""
         if game.settled:
             return {"error": "这局已经结算过了"}
@@ -819,15 +820,18 @@ class WerewolfService:
         goods = [p for p in game.players if p not in wolves]
         winners, losers = (goods, wolves) if winner == "good" else (wolves, goods)
 
-        # 赌币败方扣局费，赌命败方不扣
+        # 赌币败方扣局费，赌命败方禁言不扣币
+        from src.chat.features.abuse_guard.service.abuse_guard_service import abuse_guard_service
         collected = 0
         failed: list[int] = []
-        coin_losers = [p for p in losers if not game.player_life.get(p, False)]
-        for pid in coin_losers:
-            if await betting.deduct(pid, game.bet, "狼人杀败方局费"):
-                collected += game.bet
+        for pid in losers:
+            if game.player_life.get(pid, False):
+                await abuse_guard_service.punish_with_mute(pid, LIFE_GAMBLE_MUTE_MINUTES, guild)
             else:
-                failed.append(pid)
+                if await betting.deduct(pid, game.bet, "狼人杀败方局费"):
+                    collected += game.bet
+                else:
+                    failed.append(pid)
 
         # 赌币胜方分池
         coin_winners = [p for p in winners if not game.player_life.get(p, False)]
