@@ -329,7 +329,7 @@ WEREWOLF_USE_WOLF_CHANNEL = True
 # 子弹打光 = 游戏结束；只剩 1 人 → 冠军，多人 → 平局。
 # 败方平分给胜方（复用 werewolf settle 模式）。
 
-PRESSURE_ROULETTE_MIN_PLAYERS = 2
+PRESSURE_ROULETTE_MIN_PLAYERS = 3
 PRESSURE_ROULETTE_MAX_PLAYERS = 6
 PRESSURE_ROULETTE_DEFAULT_BET = 50          # 局费（春春币），败方每人扣这么多给胜方平分
 PRESSURE_ROULETTE_CHAMBER_SIZE = 6          # 弹巢容量
@@ -337,7 +337,10 @@ PRESSURE_ROULETTE_INITIAL_LIVE = 1          # 开局装填实弹数
 PRESSURE_ROULETTE_BASE_STAKE = 3           # 基础赌注（分钟），中弹禁言时长下限
 PRESSURE_ROULETTE_PRESS_STAKE = 1           # 每加压 1 发子弹，赌注 +多少分钟
 PRESSURE_ROULETTE_JOIN_TIME = 180           # 招募时限（秒）
-PRESSURE_ROULETTE_TURN_TIME = 60            # 每回合操作时限（秒），超时自动开枪
+PRESSURE_ROULETTE_TURN_TIME = 60            # 每回合操作时限（秒），超时自动开枪/传枪
+PRESSURE_ROULETTE_FIRST_SHOT_HIT_CHANCE = 0.15  # 第一枪中弹率（不走弹巢 1/6）
+PRESSURE_ROULETTE_UNLOAD_MIN_BULLETS = 3    # 抽弹开枪门槛：枪里至少 3 发
+PRESSURE_ROULETTE_PANEL_HISTORY_LIMIT = 3   # 面板滚动窗口保留条数
 
 # 中弹禁言用的身份组 ID；None 则不禁言（只扣局费）。
 # 复用狼人杀的普通玩家身份组即可。

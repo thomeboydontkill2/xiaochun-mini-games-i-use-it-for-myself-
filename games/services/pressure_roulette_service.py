@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
 """加压俄罗斯轮盘 —— 服务层（纯逻辑，不依赖 discord.py）。
 
-状态机：
-    joining → loading → turn → resolving → turn → ... → ended
+状态机（两层）：
+    外层 state: joining → playing → ended
+    内层 phase: fire → choice → fire → ... → ended
 
 核心规则：
 - 6 弹巢，开局 1 发实弹，位置随机。
-- 轮到当前玩家三选一：传枪 / 再开一枪 / 加压。
+- 第一枪特殊判定 15%，不走弹巢 1/6。
+- fire 阶段：扣扳机 / 抽弹 / 退出
+- choice 阶段：传枪 / 再开一枪 / 加压 / 反手还击
 - 中弹 = 禁言（当前赌注分钟）+ 出局 + 扣局费。
 - 子弹打光 = 游戏立刻结束；只剩 1 人 → 冠军；多人 → 平局。
+
+弹巢结构（对齐原项目）：
+- chambers: list[bool]  6 格，True=有子弹
+- revealed: list[bool]  6 格，True=已验过
+- hit_chambers: list[bool]  6 格，True=那一枪中弹了
+- pointer: int  枪口位置（0-5）
+
+赌注：BASE(3) + pressure_bullets(累计塞入子弹数) * 1 分钟
 
 所有方法返回 dict：成功带数据，失败带 "error"。
 """
@@ -26,6 +37,9 @@ from src.chat.features.games.config.games_config import (
 from src.chat.features.games.services import betting
 from src.chat.features.games.services.registry import GameRegistry
 
+# 第一枪特殊判定概率（不走弹巢 1/6）
+FIRST_SHOT_HIT_CHANCE = 0.15
+
 
 class PressureRouletteGame:
     """单局状态。"""
@@ -35,21 +49,47 @@ class PressureRouletteGame:
         self.bet = bet
         self.players: list[int] = []
         self.dead: list[int] = []
-        self.phase: str = "joining"
-        self.shot_count: int = 0           # 第几枪（展示用）
+        self.state: str = "joining"      # 外层：joining/playing/ended
+        self.phase: str = "idle"         # 内层：idle/fire/choice/resolving/ended
+        self.shot_number: int = 0        # 第几枪（0=第一枪）
 
-        # 弹巢：True=实弹，False=空弹。chamber_pos 是下一发要打的位置。
-        self.chamber: list[bool] = []
-        self.chamber_pos: int = 0
+        # 弹巢四字段（对齐原项目）
+        self.chambers: list[bool] = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+        self.revealed: list[bool] = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+        self.hit_chambers: list[bool] = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+        self.pointer: int = 0
+        self.bullets: int = 0            # 当前子弹数
 
-        # 当前轮到 players 中谁（索引）
-        self.current_index: int = 0
+        # 当前轮到 alive 中谁（索引）
+        self.turn_index: int = 0
+        self.turn_token: int = 0          # 轮次令牌（防过期点击）
 
-        # 每人连开蓄力层数；传枪/加压/中弹清零
-        self.streak: dict[int, int] = {}
+        # 连开蓄力（对齐原项目：连着持有人记）
+        self.charge: int = 0
+        self.charge_owner_id: int | None = None
 
-        # 当前赌注（分钟）：基础 3，每加压 1 发 +1
+        # 加压统计
+        self.pressure: int = 0            # 加压次数
+        self.pressure_bullets: int = 0    # 累计塞入子弹数（用于赌注）
+
+        # 赌注（分钟）：BASE + pressure_bullets * 1
         self.stake_minutes: int = PRESSURE_ROULETTE_BASE_STAKE
+
+        # 抽弹开枪
+        self.unload_used: list[int] = []   # 用过抽弹的人
+        self.unload_shot_owner: int | None = None  # 抽弹枪一次性标记
+
+        # 反手还击
+        self.riposte_holder_id: int | None = None   # 反手权持有者
+        self.riposte_target_id: int | None = None   # 反手目标（加压者）
+        self.riposte: dict | None = None             # 进行中的反手序列
+
+        # 胆小鬼退出
+        self.cowards: list[dict] = []      # [{user_id, stake_minutes, penalty_minutes}]
+        self.redeemers: list[int] = []     # 戴罪上桌名单（开局快照）
+
+        # 出局记录
+        self.eliminated: list[dict] = []   # [{user_id, minutes, virtual}]
 
         self.settled: bool = False
         self.winner: int | None = None     # None = 平局或未结束
@@ -62,40 +102,112 @@ class PressureRouletteGame:
         alive = self.alive()
         if not alive:
             return None
-        # current_index 可能因为有人出局而越界，按存活列表取
-        idx = self.current_index % len(self.players)
-        # 找下一个存活的人
-        for _ in range(len(self.players)):
-            p = self.players[idx]
-            if p not in self.dead:
-                return p
-            idx = (idx + 1) % len(self.players)
-        return None
+        idx = self.turn_index % len(alive)
+        return alive[idx]
+
+    def unknown_count(self) -> int:
+        """未验过的格子数。"""
+        return sum(1 for r in self.revealed if not r)
 
     def remaining_live(self) -> int:
-        """弹巢里还没打掉的实弹数。"""
-        return sum(1 for i in range(self.chamber_pos, len(self.chamber)) if self.chamber[i])
+        """弹巢里还没打掉的实弹数 = bullets（因为中弹会扣 bullets）。"""
+        return self.bullets
 
     def remaining_chamber(self) -> int:
-        """弹巢里还没打掉的格数。"""
-        return len(self.chamber) - self.chamber_pos
+        """未验过的格数。"""
+        return self.unknown_count()
+
+    def hit_chance(self) -> float:
+        """中弹概率 = bullets / unknown_count。"""
+        unknown = self.unknown_count()
+        return self.bullets / unknown if unknown > 0 else 0.0
+
+    def charge_for(self, user_id: int) -> int:
+        """某人的蓄力层数。"""
+        if self.charge_owner_id != user_id:
+            return 0
+        return self.charge
+
+    def set_charge(self, user_id: int | None, value: int) -> None:
+        """设置蓄力。value=0 时清空 owner。"""
+        self.charge = max(0, value)
+        self.charge_owner_id = user_id if self.charge > 0 else None
+
+    def load_bullets_for(self, user_id: int) -> int:
+        """这次加压实际能塞几发：min(1 + charge, CHAMBER - bullets)。"""
+        return min(1 + self.charge_for(user_id),
+                   PRESSURE_ROULETTE_CHAMBER_SIZE - self.bullets)
+
+    def current_stake(self) -> int:
+        """当前赌注分钟 = BASE + pressure_bullets。"""
+        return PRESSURE_ROULETTE_BASE_STAKE + self.pressure_bullets * PRESSURE_ROULETTE_PRESS_STAKE
 
     def chamber_display(self) -> list[str]:
-        """弹巢可视化：已开的显示 空/砰，未开的显示 ?。"""
+        """弹巢可视化：next/hit/spent/unknown → 枪口/砰/空/?。"""
         out: list[str] = []
-        for i, live in enumerate(self.chamber):
-            if i < self.chamber_pos:
-                out.append("砰" if live else "空")
+        for i in range(len(self.chambers)):
+            if self.state == "playing" and i == self.pointer and not self.revealed[i]:
+                out.append("枪口")
+            elif self.revealed[i]:
+                out.append("砰" if self.hit_chambers[i] else "空")
             else:
                 out.append("?")
         return out
 
+    def is_redeemer(self, user_id: int) -> bool:
+        """是否戴罪上桌。"""
+        return user_id in self.redeemers
 
-def _roll_chamber(size: int, live: int) -> list[bool]:
-    """装填弹巢：live 发实弹 + (size-live) 发空弹，随机洗牌。"""
-    chamber = [True] * live + [False] * (size - live)
-    random.shuffle(chamber)
-    return chamber
+
+def _spin_cylinder(game: PressureRouletteGame) -> None:
+    """重洗弹巢：把 bullets 发子弹随机放到 6 格。"""
+    positions = list(range(PRESSURE_ROULETTE_CHAMBER_SIZE))
+    random.shuffle(positions)
+    game.chambers = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+    for i in range(min(game.bullets, PRESSURE_ROULETTE_CHAMBER_SIZE)):
+        game.chambers[positions[i]] = True
+    game.revealed = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+    game.hit_chambers = [False] * PRESSURE_ROULETTE_CHAMBER_SIZE
+    game.pointer = 0
+
+
+def _place_first_shot_bullet(game: PressureRouletteGame, should_hit: bool) -> None:
+    """把子弹摆成「枪口那一格是否有子弹」的指定结果（第一枪特殊判定）。"""
+    pointer = game.pointer
+    if game.chambers[pointer] == should_hit:
+        return
+    candidates = [i for i in range(PRESSURE_ROULETTE_CHAMBER_SIZE)
+                  if i != pointer and game.chambers[i] == should_hit]
+    if not candidates:
+        return
+    target = random.choice(candidates)
+    game.chambers[pointer] = should_hit
+    game.chambers[target] = not should_hit
+
+
+def _release_riposte(game: PressureRouletteGame, user_id: int) -> None:
+    """出局/退出时收尾反手权。"""
+    if game.riposte:
+        if game.riposte.get("initiator_id") == user_id:
+            game.riposte = None
+        elif game.riposte.get("target_id") == user_id and game.riposte.get("stage") == "target":
+            game.riposte = None
+
+    if game.riposte_holder_id == user_id:
+        alive = game.alive()
+        if alive:
+            game.riposte_holder_id = alive[game.turn_index % len(alive)]
+        else:
+            game.riposte_holder_id = None
+        if not game.riposte_holder_id:
+            game.riposte_target_id = None
+        if game.riposte_holder_id == game.riposte_target_id:
+            game.riposte_holder_id = None
+            game.riposte_target_id = None
+
+    if game.riposte_target_id == user_id:
+        game.riposte_holder_id = None
+        game.riposte_target_id = None
 
 
 class PressureRouletteService:
@@ -125,247 +237,392 @@ class PressureRouletteService:
         game = self.get_game(channel_id)
         if game is None:
             return False, "这局已经没了。"
-        if game.phase != "joining":
+        if game.state != "joining":
             return False, "已经开局了，等下一局吧。"
         if user_id in game.players:
             return False, "你已经上桌了。"
         if len(game.players) >= PRESSURE_ROULETTE_MAX_PLAYERS:
             return False, f"桌满了（最多 {PRESSURE_ROULETTE_MAX_PLAYERS} 人）。"
         game.players.append(user_id)
-        game.streak[user_id] = 0
         return True, "上桌了"
 
     def leave_player(self, channel_id: int, user_id: int) -> tuple[bool, str]:
         game = self.get_game(channel_id)
         if game is None:
             return False, "这局已经没了。"
-        if game.phase != "joining":
+        if game.state != "joining":
             return False, "已经开局了，退不了。"
         if user_id not in game.players:
             return False, "你根本没上桌。"
         game.players.remove(user_id)
-        game.streak.pop(user_id, None)
         return True, "退了"
 
     def start_game(self, channel_id: int) -> tuple[bool, str, PressureRouletteGame | None]:
         game = self.get_game(channel_id)
         if game is None:
             return False, "这局已经没了。", None
-        if game.phase != "joining":
+        if game.state != "joining":
             return False, "已经开局了。", None
         if len(game.players) < PRESSURE_ROULETTE_MIN_PLAYERS:
             return False, f"人不够，至少 {PRESSURE_ROULETTE_MIN_PLAYERS} 人。", None
         # 装弹
-        game.chamber = _roll_chamber(PRESSURE_ROULETTE_CHAMBER_SIZE, PRESSURE_ROULETTE_INITIAL_LIVE)
-        game.chamber_pos = 0
-        game.phase = "turn"
-        game.current_index = 0
-        game.shot_count = 0
-        game.stake_minutes = PRESSURE_ROULETTE_BASE_STAKE
+        game.bullets = PRESSURE_ROULETTE_INITIAL_LIVE
+        _spin_cylinder(game)
+        # 第一枪特殊判定
+        _place_first_shot_bullet(game, random.random() < FIRST_SHOT_HIT_CHANCE)
+        game.state = "playing"
+        game.phase = "fire"
+        game.turn_index = 0
+        game.shot_number = 0
+        game.pressure = 0
+        game.pressure_bullets = 0
+        game.set_charge(None, 0)
+        game.turn_token += 1
         return True, "开局", game
 
-    # ==================== 操作 ====================
-
-    def pass_gun(self, channel_id: int, user_id: int) -> dict:
-        """传枪：弹巢前进一格，交给下一个人。"""
-        game = self.get_game(channel_id)
-        if game is None:
-            return {"error": "这局已经没了。"}
-        if game.phase != "turn":
-            return {"error": "现在不是你的回合。"}
-        cur = game.current_player()
-        if cur != user_id:
-            return {"error": "还没轮到你。"}
-        # 弹巢前进一格（消耗一发空弹的位置——传枪不扣扳机但弹巢转动）
-        # 按你规则：传枪 = 弹巢前进一格，交给下一个人
-        if game.chamber_pos < len(game.chamber):
-            game.chamber_pos += 1
-        # 蓄力清零
-        game.streak[user_id] = 0
-        # 检查子弹打光
-        if game.remaining_live() == 0:
-            return self._end_game(game, reason="bullets_empty")
-        # 轮到下家
-        self._advance_to_next_alive(game)
-        return {
-            "action": "pass",
-            "by": user_id,
-            "next": game.current_player(),
-            "chamber": game.chamber_display(),
-            "remaining_live": game.remaining_live(),
-            "remaining_chamber": game.remaining_chamber(),
-            "stake_minutes": game.stake_minutes,
-            "game_over": False,
-        }
+    # ==================== fire 阶段：扣扳机 / 抽弹 / 退出 ====================
 
     def shoot_self(self, channel_id: int, user_id: int) -> dict:
-        """再开一枪：对自己扣扳机。"""
-        return self._shoot(channel_id, user_id, target=None, pressed=True)
+        """对自己扣扳机。"""
+        return self._perform_shot(channel_id, user_id)
 
-    def shoot_target(self, channel_id: int, user_id: int, target_id: int) -> dict:
-        """对别人开枪（第一阶段不开放，保留接口）。"""
-        return self._shoot(channel_id, user_id, target=target_id, pressed=False)
-
-    def _shoot(self, channel_id: int, user_id: int, target: int | None, pressed: bool) -> dict:
+    def _perform_shot(self, channel_id: int, user_id: int) -> dict:
         game = self.get_game(channel_id)
         if game is None:
             return {"error": "这局已经没了。"}
-        if game.phase != "turn":
-            return {"error": "现在不是你的回合。"}
+        if game.state != "playing" or game.phase != "fire":
+            return {"error": "现在不是开枪阶段。"}
         cur = game.current_player()
         if cur != user_id:
             return {"error": "还没轮到你。"}
-        if game.chamber_pos >= len(game.chamber):
-            # 弹巢空了，理论上不会到这里（子弹打光应该已结束）
-            return {"error": "弹巢空了。"}
 
-        # 实际开枪对象：第一阶段只对自己开
-        victim = user_id if target is None else target
-        live = game.chamber[game.chamber_pos]
-        game.chamber_pos += 1
-        game.shot_count += 1
+        shooter_id = user_id
+        index = game.pointer
+        hit = game.chambers[index] is True
+        bullets_before = game.bullets
+        unknown_before = game.unknown_count()
+        first_shot = game.shot_number == 0
 
-        if live:
-            # 中弹
-            game.dead.append(victim)
-            game.streak[victim] = 0
-            # 子弹打光检查
-            if game.remaining_live() == 0:
-                return self._end_game(game, reason="bullets_empty", last_victim=victim, hit=True)
-            # 检查是否只剩 1 人
+        game.revealed[index] = True
+        if hit:
+            game.chambers[index] = False
+            game.hit_chambers[index] = True
+            game.bullets = max(0, game.bullets - 1)
+            game.set_charge(shooter_id, 0)
+        game.pointer = (index + 1) % PRESSURE_ROULETTE_CHAMBER_SIZE
+        game.shot_number += 1
+        game.turn_token += 1
+
+        # 抽弹枪一次性标记消费
+        unload_shot = game.unload_shot_owner == shooter_id
+        if unload_shot:
+            game.unload_shot_owner = None
+
+        # 反手序列推进
+        riposte_stage = game.riposte.get("stage") if game.riposte else None
+        if riposte_stage == "target":
+            initiator_id = game.riposte["initiator_id"]
+            game.riposte["stage"] = "return"
             alive = game.alive()
-            if len(alive) <= 1:
-                return self._end_game(game, reason="last_man", last_victim=victim, hit=True)
-            # 中弹者出局，轮到下家
-            self._advance_to_next_alive(game)
-            return {
-                "action": "shoot",
-                "by": user_id,
-                "victim": victim,
-                "hit": True,
-                "shot_count": game.shot_count,
-                "chamber": game.chamber_display(),
-                "remaining_live": game.remaining_live(),
-                "remaining_chamber": game.remaining_chamber(),
-                "stake_minutes": game.stake_minutes,
-                "next": game.current_player(),
-                "game_over": False,
-                "mute_minutes": game.stake_minutes,
-            }
+            if initiator_id in alive and shooter_id in alive:
+                initiator_idx = alive.index(initiator_id)
+                target_idx = alive.index(shooter_id)
+                if hit:
+                    game.turn_index = initiator_idx - 1 if initiator_idx > target_idx else initiator_idx
+                else:
+                    game.turn_index = initiator_idx
+            else:
+                game.riposte = None
+        elif riposte_stage == "return":
+            game.riposte = None
         else:
-            # 空弹
-            # 蓄力 +1（只有对自己开枪才累积；对别人开枪不累积）
-            if target is None:
-                game.streak[user_id] = game.streak.get(user_id, 0) + 1
-            # 子弹打光检查
-            if game.remaining_live() == 0:
-                return self._end_game(game, reason="bullets_empty", last_victim=victim, hit=False)
-            # 轮到下家
-            self._advance_to_next_alive(game)
+            pass
+
+        if hit:
+            game.phase = "resolving"
+            return self._resolve_hit(game, shooter_id, unload_shot, riposte_stage)
+        else:
+            # 空枪
+            if riposte_stage == "target":
+                # 加压者空枪 → 发起人补枪（return 阶段）
+                game.phase = "fire"
+                return {
+                    "action": "shoot", "by": shooter_id, "hit": False,
+                    "shot_count": game.shot_number,
+                    "chamber": game.chamber_display(),
+                    "bullets": game.bullets, "unknown_count": game.unknown_count(),
+                    "stake_minutes": game.current_stake(),
+                    "next": game.current_player(),
+                    "riposte_stage": "target",
+                    "game_over": False,
+                }
+            if unload_shot:
+                # 抽弹活下来 → 强制传枪
+                return self._handle_choice_internal(game, "pass")
+            game.phase = "choice"
+            game.turn_token += 1
             return {
-                "action": "shoot",
-                "by": user_id,
-                "victim": victim,
-                "hit": False,
-                "shot_count": game.shot_count,
+                "action": "shoot", "by": shooter_id, "hit": False,
+                "shot_count": game.shot_number,
                 "chamber": game.chamber_display(),
-                "remaining_live": game.remaining_live(),
-                "remaining_chamber": game.remaining_chamber(),
-                "stake_minutes": game.stake_minutes,
+                "bullets": game.bullets, "unknown_count": game.unknown_count(),
+                "stake_minutes": game.current_stake(),
                 "next": game.current_player(),
-                "streak": game.streak.get(user_id, 0),
+                "streak": game.charge_for(shooter_id),
                 "game_over": False,
             }
 
-    def press(self, channel_id: int, user_id: int) -> dict:
-        """加压：装 1+蓄力层数 发子弹并滚动弹巢，赌注 +1 分钟/发。
+    def _resolve_hit(self, game: PressureRouletteGame, victim_id: int,
+                     unload_shot: bool, riposte_stage: str | None) -> dict:
+        """中弹结算。"""
+        stake_minutes = game.current_stake()
+        game.dead.append(victim_id)
+        game.eliminated.append({"user_id": victim_id, "minutes": stake_minutes})
+        _release_riposte(game, victim_id)
 
-        蓄力清零。加压后仍轮到自己（要对自己开一枪）。
-        """
-        game = self.get_game(channel_id)
-        if game is None:
-            return {"error": "这局已经没了。"}
-        if game.phase != "turn":
-            return {"error": "现在不是你的回合。"}
-        cur = game.current_player()
-        if cur != user_id:
-            return {"error": "还没轮到你。"}
+        # 子弹打光检查
+        if game.bullets <= 0:
+            return self._end_game(game, reason="bullets_empty",
+                                  last_victim=victim_id, hit=True)
+        # 只剩 1 人
+        alive = game.alive()
+        if len(alive) <= 1:
+            return self._end_game(game, reason="last_man",
+                                  last_victim=victim_id, hit=True)
 
-        streak = game.streak.get(user_id, 0)
-        new_live = 1 + streak  # 装 1 + 蓄力层数 发
-
-        # 把新子弹塞进弹巢剩余空位 + 已开过的位置重置
-        # 按你规则：装 1+蓄力层数 发子弹并滚动弹巢
-        # 实现：重置弹巢为 (剩余空弹数 + 新实弹数) 的全新洗牌
-        # 剩余空弹 = 弹巢总长 - 已开格数 - 剩余实弹
-        used = game.chamber_pos
-        remaining_live_before = game.remaining_live()
-        remaining_empty_before = (len(game.chamber) - used) - remaining_live_before
-        total_live = remaining_live_before + new_live
-        total_empty = max(0, remaining_empty_before)  # 空弹可能被新实弹挤掉
-        # 新弹巢：把已开过的固定为结果，未开的重新洗
-        # 简化：整个弹巢重新装填（已开过的位置保持原结果，未开的重新随机）
-        new_size = len(game.chamber)
-        # 已开部分固定
-        opened = game.chamber[:used]
-        # 未开部分重新装填
-        unopened_live = total_live
-        unopened_empty = new_size - used - unopened_live
-        if unopened_empty < 0:
-            # 实弹比剩余格数多，挤掉空弹
-            unopened_live = new_size - used
-            unopened_empty = 0
-        unopened = [True] * unopened_live + [False] * unopened_empty
-        random.shuffle(unopened)
-        game.chamber = opened + unopened
-        # chamber_pos 不变（已开过的位置固定）
-
-        # 赌注 +1 分钟/发
-        game.stake_minutes += new_live * PRESSURE_ROULETTE_PRESS_STAKE
-        # 蓄力清零
-        game.streak[user_id] = 0
-
+        # 轮到下家
+        alive = game.alive()
+        if game.turn_index >= len(alive):
+            game.turn_index = 0
+        game.phase = "fire"
+        game.turn_token += 1
         return {
-            "action": "press",
-            "by": user_id,
-            "loaded": new_live,
-            "stake_minutes": game.stake_minutes,
+            "action": "shoot", "by": victim_id, "victim": victim_id, "hit": True,
+            "shot_count": game.shot_number,
             "chamber": game.chamber_display(),
-            "remaining_live": game.remaining_live(),
-            "remaining_chamber": game.remaining_chamber(),
+            "bullets": game.bullets, "unknown_count": game.unknown_count(),
+            "stake_minutes": stake_minutes,
+            "next": game.current_player(),
+            "mute_minutes": stake_minutes,
             "game_over": False,
         }
 
-    def timeout_shoot(self, channel_id: int) -> dict:
-        """超时自动开枪：对当前玩家自己开一枪。"""
+    # ==================== choice 阶段：传枪 / 再开 / 加压 / 反手 ====================
+
+    def handle_choice(self, channel_id: int, user_id: int, action: str) -> dict:
+        """choice 阶段操作。action: pass/again/load/riposte。"""
         game = self.get_game(channel_id)
         if game is None:
             return {"error": "这局已经没了。"}
-        if game.phase != "turn":
-            return {"error": "现在不是回合阶段。"}
+        if game.state != "playing" or game.phase != "choice":
+            return {"error": "现在不是选择阶段。"}
+        cur = game.current_player()
+        if cur != user_id:
+            return {"error": "还没轮到你。"}
+        return self._handle_choice_internal(game, action)
+
+    def _handle_choice_internal(self, game: PressureRouletteGame, action: str) -> dict:
+        """内部 choice 处理（不校验 phase，用于强制传枪等）。"""
+        actor_id = game.current_player()
+        if actor_id is None:
+            return {"error": "没有当前玩家。"}
+
+        effective_action = action
+        # 满巢时 load 降级为 pass
+        if effective_action == "load" and game.bullets >= PRESSURE_ROULETTE_CHAMBER_SIZE:
+            effective_action = "pass"
+
+        charge = game.charge_for(actor_id)
+        loaded_bullets = 0
+        cleared_charge = 0
+
+        if effective_action == "load":
+            loaded_bullets = game.load_bullets_for(actor_id)
+            game.bullets += loaded_bullets
+            game.pressure += 1
+            game.pressure_bullets += loaded_bullets
+            _spin_cylinder(game)
+
+        if effective_action == "again":
+            game.set_charge(actor_id, charge + 1)
+        else:
+            cleared_charge = charge
+            game.set_charge(actor_id, 0)
+
+        # turn_index 推进（again 不推进）
+        if effective_action != "again":
+            alive = game.alive()
+            game.turn_index = (game.turn_index + 1) % len(alive)
+
+        # 反手权联动
+        if effective_action == "load":
+            game.riposte_target_id = actor_id
+            alive = game.alive()
+            game.riposte_holder_id = alive[game.turn_index % len(alive)]
+        elif effective_action == "pass" and game.riposte_holder_id == actor_id:
+            game.riposte_holder_id = None
+            game.riposte_target_id = None
+
+        game.phase = "fire"
+        game.turn_token += 1
+
+        return {
+            "action": effective_action, "by": actor_id,
+            "loaded": loaded_bullets, "cleared_charge": cleared_charge,
+            "stake_minutes": game.current_stake(),
+            "chamber": game.chamber_display(),
+            "bullets": game.bullets, "unknown_count": game.unknown_count(),
+            "next": game.current_player(),
+            "game_over": False,
+        }
+
+    # ==================== fire 阶段：抽弹开枪 ====================
+
+    def unload(self, channel_id: int, user_id: int) -> dict:
+        """🔧 抽弹开枪：卸 1 发 → 重洗 → 立刻扣扳机。"""
+        game = self.get_game(channel_id)
+        if game is None:
+            return {"error": "这局已经没了。"}
+        if game.state != "playing" or game.phase != "fire":
+            return {"error": "现在不是开枪阶段。"}
+        cur = game.current_player()
+        if cur != user_id:
+            return {"error": "还没轮到你。"}
+        if game.riposte:
+            return {"error": "反手序列中不能抽弹。"}
+        if game.bullets < 3:
+            return {"error": "枪里至少 3 发才能抽弹。"}
+        if user_id in game.unload_used:
+            return {"error": "你这局已经抽过弹了。"}
+
+        game.bullets = max(0, game.bullets - 1)
+        _spin_cylinder(game)
+        game.unload_used.append(user_id)
+        game.set_charge(user_id, 0)
+        game.unload_shot_owner = user_id
+        game.turn_token += 1
+
+        # 立刻扣扳机
+        return self._perform_shot(channel_id, user_id)
+
+    # ==================== choice 阶段：反手还击 ====================
+
+    def riposte(self, channel_id: int, user_id: int) -> dict:
+        """🔙 反手还击：把枪扔回给加压者。"""
+        game = self.get_game(channel_id)
+        if game is None:
+            return {"error": "这局已经没了。"}
+        if game.state != "playing" or game.phase != "choice":
+            return {"error": "现在不是选择阶段。"}
+        cur = game.current_player()
+        if cur != user_id:
+            return {"error": "还没轮到你。"}
+        if game.riposte:
+            return {"error": "已经有反手序列在进行。"}
+        if game.riposte_holder_id != user_id:
+            return {"error": "你没有反手权。"}
+        if not game.riposte_target_id or game.riposte_target_id not in game.alive():
+            return {"error": "反手目标已不在场。"}
+
+        target_id = game.riposte_target_id
+        game.riposte = {"initiator_id": user_id, "target_id": target_id, "stage": "target"}
+        game.riposte_holder_id = None
+        game.riposte_target_id = None
+        game.set_charge(user_id, 0)
+        alive = game.alive()
+        game.turn_index = alive.index(target_id)
+        game.phase = "fire"
+        game.turn_token += 1
+
+        return {
+            "action": "riposte", "by": user_id, "target": target_id,
+            "chamber": game.chamber_display(),
+            "bullets": game.bullets, "unknown_count": game.unknown_count(),
+            "stake_minutes": game.current_stake(),
+            "next": game.current_player(),
+            "game_over": False,
+        }
+
+    # ==================== fire 阶段：胆小鬼退出 ====================
+
+    def quit(self, channel_id: int, user_id: int) -> dict:
+        """🤡 胆小鬼退出。"""
+        game = self.get_game(channel_id)
+        if game is None:
+            return {"error": "这局已经没了。"}
+        if game.state != "playing" or game.phase != "fire":
+            return {"error": "现在不是开枪阶段。"}
+        cur = game.current_player()
+        if cur != user_id:
+            return {"error": "还没轮到你。"}
+        if game.is_redeemer(user_id):
+            return {"error": "你是戴罪上桌的，没有第二次。"}
+        if game.riposte:
+            return {"error": "反手序列中不能逃。"}
+
+        game.dead.append(user_id)
+        stake_minutes = game.current_stake()
+        penalty_minutes = max(5, stake_minutes)  # 至少 5 分钟
+        game.cowards.append({
+            "user_id": user_id, "stake_minutes": stake_minutes,
+            "penalty_minutes": penalty_minutes,
+        })
+        _release_riposte(game, user_id)
+        game.turn_token += 1
+
+        # 检查是否结束
+        alive = game.alive()
+        if len(alive) <= 1:
+            return self._end_game(game, reason="last_man",
+                                   last_victim=user_id, hit=False,
+                                   coward=True, penalty_minutes=penalty_minutes)
+
+        if game.turn_index >= len(alive):
+            game.turn_index = 0
+        game.phase = "fire"
+        return {
+            "action": "quit", "by": user_id,
+            "penalty_minutes": penalty_minutes,
+            "stake_minutes": stake_minutes,
+            "next": game.current_player(),
+            "chamber": game.chamber_display(),
+            "bullets": game.bullets, "unknown_count": game.unknown_count(),
+            "game_over": False,
+        }
+
+    # ==================== 超时 ====================
+
+    def timeout_fire(self, channel_id: int) -> dict:
+        """fire 阶段超时：自动开枪。"""
+        game = self.get_game(channel_id)
+        if game is None:
+            return {"error": "这局已经没了。"}
+        if game.state != "playing" or game.phase != "fire":
+            return {"error": "现在不是开枪阶段。"}
         cur = game.current_player()
         if cur is None:
             return {"error": "没有当前玩家。"}
-        return self._shoot(channel_id, cur, target=None, pressed=True)
+        return self._perform_shot(channel_id, cur)
+
+    def timeout_choice(self, channel_id: int) -> dict:
+        """choice 阶段超时：自动传枪。"""
+        game = self.get_game(channel_id)
+        if game is None:
+            return {"error": "这局已经没了。"}
+        if game.state != "playing" or game.phase != "choice":
+            return {"error": "现在不是选择阶段。"}
+        cur = game.current_player()
+        if cur is None:
+            return {"error": "没有当前玩家。"}
+        return self._handle_choice_internal(game, "pass")
 
     # ==================== 内部 ====================
 
-    def _advance_to_next_alive(self, game: PressureRouletteGame) -> None:
-        """轮到下一个存活玩家。"""
-        if not game.alive():
-            return
-        idx = game.current_index
-        for _ in range(len(game.players)):
-            idx = (idx + 1) % len(game.players)
-            if game.players[idx] not in game.dead:
-                game.current_index = idx
-                return
-        # 兜底
-        game.current_index = idx
-
     def _end_game(self, game: PressureRouletteGame, reason: str,
-                  last_victim: int | None = None, hit: bool = False) -> dict:
-        """结束游戏。reason: bullets_empty / last_man。"""
+                  last_victim: int | None = None, hit: bool = False,
+                  coward: bool = False, penalty_minutes: int = 0) -> dict:
+        """结束游戏。reason: bullets_empty / last_man / aborted。"""
+        game.state = "ended"
         game.phase = "ended"
         alive = game.alive()
         if len(alive) == 1:
@@ -374,7 +631,7 @@ class PressureRouletteService:
             game.winner = None  # 平局
 
         result = {
-            "action": "shoot" if hit else "end",
+            "action": "shoot" if hit else ("quit" if coward else "end"),
             "game_over": True,
             "reason": reason,
             "winner": game.winner,
@@ -383,12 +640,14 @@ class PressureRouletteService:
             "last_victim": last_victim,
             "last_hit": hit,
             "hit": hit,
-            "stake_minutes": game.stake_minutes,
+            "stake_minutes": game.current_stake(),
             "chamber": game.chamber_display(),
-            "remaining_live": game.remaining_live(),
+            "bullets": game.bullets,
         }
         if last_victim is not None and hit:
-            result["mute_minutes"] = game.stake_minutes
+            result["mute_minutes"] = game.current_stake()
+        if coward:
+            result["penalty_minutes"] = penalty_minutes
         return result
 
     # ==================== 结算 ====================
@@ -401,7 +660,6 @@ class PressureRouletteService:
         self._active_games.pop(game.channel_id)
 
         if game.winner is None:
-            # 平局，不扣币
             return {"winner": None, "pool": 0, "share": 0, "deduct_failed": []}
 
         winners = [game.winner]
