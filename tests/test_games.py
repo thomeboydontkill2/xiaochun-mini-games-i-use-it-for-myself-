@@ -198,7 +198,7 @@ def test_duel_tie_replays_round():
     svc.submit_choice(1, "石头")
     r = svc.submit_choice(2, "石头")
     assert r["round_result"]["tie"] and not r["game_over"]
-    assert game.round == 1 and game.p1_choice is None
+    assert game.round == 2 and game.p1_choice is None
 
 
 def test_duel_settle_failure_rolls_back(coin):

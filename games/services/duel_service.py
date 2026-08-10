@@ -103,6 +103,7 @@ class DuelService:
             if game.round >= DUEL_MAX_ROUNDS:
                 self._cleanup(game)
                 return {"round_result": result, "game_over": True, "draw": True}
+            game.round += 1
             return {"round_result": result, "game_over": False}
 
         if WIN_MAP[c1] == c2:
