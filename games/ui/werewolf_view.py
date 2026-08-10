@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-狼人杀 UI —— 招募、夜晚私信操作、白天轮流发言、投票、猎人开枪。
+狼人杀 UI —— 招募、局初统计、夜晚（狼人私密频道 + 私信）、警长竞选、
+轮流发言（可选按身份组禁言）、投票、死亡公开身份、猎人开枪、警徽移交。
 
-设计要点（沿用之前踩坑后的两条铁律）：
-1. 先响应交互，再做慢操作（发私信、遍历成员）。Discord 交互令牌只有 3 秒，
-   任何"先发一圈私信再更新公屏"的写法都会静默失败。
-2. 所有公屏播报都走 _say()：失败会逐层降级并记日志，绝不允许流程静默卡死。
-
-夜晚是一个由 advance_night() 驱动的状态机：
-每个角色的操作 View 完成（或超时）后都会再调一次 advance_night()，推进到下一个角色，
-直到 night_resolve 时统一结算并公示。
+两条铁律（沿用之前踩坑经验）：
+1. 先响应交互，再做慢操作（发私信 / 建频道 / 改权限）。交互令牌只有 3 秒。
+2. 所有公屏播报走 _say()、私信走 _dm()：失败记日志并降级，绝不让流程静默卡死。
 """
 
 import logging
@@ -20,6 +16,10 @@ from discord.ui import View, Select, Button, Modal, TextInput, select, button
 from src.chat.features.games.config.games_config import (
     WEREWOLF_MIN_PLAYERS, WEREWOLF_JOIN_TIME, WEREWOLF_NIGHT_ACTION_TIME,
     WEREWOLF_SPEAK_TIME, WEREWOLF_VOTE_TIME, WEREWOLF_HUNTER_SHOOT_TIME,
+    WEREWOLF_CAMPAIGN_SPEAK_TIME, WEREWOLF_SHERIFF_VOTE_TIME,
+    WEREWOLF_SHERIFF_SIGNUP_TIME, WEREWOLF_SHERIFF_TRANSFER_TIME,
+    WEREWOLF_ELECT_SHERIFF, WEREWOLF_MUTE_ROLE_ID, WEREWOLF_MUTE_DURING_DISCUSSION,
+    WEREWOLF_USE_WOLF_CHANNEL, WEREWOLF_WOLF_CHANNEL_CATEGORY_ID,
     ROLE_WOLF, ROLE_WITCH, ROLE_SEER, ROLE_GUARD,
 )
 from src.chat.features.games.services import betting
@@ -29,6 +29,9 @@ from src.chat.features.games.services.werewolf_service import (
 
 log = logging.getLogger(__name__)
 
+# 每局临时建的狼人私密频道：公屏 channel_id -> 频道对象
+_wolf_channels: dict[int, "discord.abc.GuildChannel"] = {}
+
 
 def _name(guild, uid: int) -> str:
     m = guild.get_member(uid) if guild else None
@@ -37,6 +40,31 @@ def _name(guild, uid: int) -> str:
 
 def _options(guild, ids: list[int]) -> list[discord.SelectOption]:
     return [discord.SelectOption(label=_name(guild, pid), value=str(pid)) for pid in ids]
+
+
+def _reveal(game, uid: int) -> str:
+    """带身份（和警长标记）的死亡展示。"""
+    badge = "👮 " if game and game.sheriff_id == uid else ""
+    return f"{badge}<@{uid}>（{game.roles.get(uid, '？')}）"
+
+
+async def _set_mute(guild, channel, mute: bool):
+    """按身份组禁言/解禁当前频道。未配置身份组或权限不足则静默跳过。"""
+    if not WEREWOLF_MUTE_DURING_DISCUSSION or not WEREWOLF_MUTE_ROLE_ID:
+        return
+    if guild is None or channel is None:
+        return
+    role = guild.get_role(WEREWOLF_MUTE_ROLE_ID)
+    if role is None:
+        log.warning("狼人杀禁言失败：找不到身份组 %s", WEREWOLF_MUTE_ROLE_ID)
+        return
+    try:
+        ow = channel.overwrites_for(role)
+        ow.send_messages = False if mute else None
+        await channel.set_permissions(role, overwrite=ow,
+                                      reason="狼人杀发言禁言" if mute else "狼人杀发言解禁")
+    except Exception:
+        log.exception("狼人杀改禁言权限失败（检查机器人「管理身份组」权限）")
 
 
 async def _say(channel, content: str, view: View | None = None):
@@ -125,11 +153,11 @@ class WerewolfJoinView(View):
         for c in self.children:
             c.disabled = True
 
-        # 先响应，再发身份私信（私信是慢操作，放在响应之后）
         await interaction.response.edit_message(
             content=(
                 f"🐺 **狼人杀开局！** 共 {len(game.players)} 人\n"
                 f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
+                f"📋 本局配置：**{game.role_summary()}**\n"
                 f"身份正在私信发送中……"
             ),
             view=None,
@@ -140,14 +168,10 @@ class WerewolfJoinView(View):
         dm_failed: list[int] = []
         for pid in game.players:
             role = game.roles[pid]
-            intro = ROLE_INTROS.get(role, f"你的身份：{role}")
-            body = f"🎭 **本局你的身份：{role}**\n{intro}"
+            body = f"🎭 **本局你的身份：{role}**\n{ROLE_INTROS.get(role, '')}"
             if role == ROLE_WOLF:
                 mates = [p for p in game.holders(ROLE_WOLF, alive_only=False) if p != pid]
-                if mates:
-                    body += "\n\n你的狼队友：" + "、".join(_name(guild, m) for m in mates)
-                else:
-                    body += "\n\n你是本局唯一的狼。"
+                body += ("\n\n你的狼队友：" + "、".join(_name(guild, m) for m in mates)) if mates else "\n\n你是本局唯一的狼。"
             if not await _dm(guild, pid, body):
                 dm_failed.append(pid)
 
@@ -163,12 +187,10 @@ class WerewolfJoinView(View):
 
 
 async def advance_night(channel, guild, channel_id: int):
-    """把夜晚推到下一个需要人操作的角色；没有人可操作时直接结算。"""
     game = werewolf_service.get_game(channel_id)
     if game is None:
         return
     phase = game.phase
-
     if phase == "night_guard":
         await _prompt_guard(channel, guild, game)
     elif phase == "night_wolf":
@@ -193,12 +215,57 @@ async def _prompt_guard(channel, guild, game):
         await advance_night(channel, guild, game.channel_id)
 
 
+async def _create_wolf_channel(guild, base_channel, game):
+    """给狼人建临时私密频道。失败返回 None（回退到私信）。"""
+    if not WEREWOLF_USE_WOLF_CHANNEL or guild is None:
+        return None
+    try:
+        me = guild.me
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        if me is not None:
+            overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        for w in game.holders(ROLE_WOLF):
+            member = guild.get_member(w)
+            if member is not None:
+                overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        category = None
+        if WEREWOLF_WOLF_CHANNEL_CATEGORY_ID:
+            category = guild.get_channel(WEREWOLF_WOLF_CHANNEL_CATEGORY_ID)
+        elif getattr(base_channel, "category", None) is not None:
+            category = base_channel.category
+        return await guild.create_text_channel(
+            name=f"狼人频道-{game.channel_id % 10000}", overwrites=overwrites,
+            category=category, reason="狼人杀狼人私密讨论")
+    except Exception:
+        log.exception("狼人杀建狼人频道失败（检查机器人「管理频道」权限），回退到私信")
+        return None
+
+
+async def _cleanup_wolf_channel(channel_id: int):
+    ch = _wolf_channels.pop(channel_id, None)
+    if ch is not None:
+        try:
+            await ch.delete(reason="狼人杀狼人频道回收")
+        except Exception:
+            log.warning("狼人杀狼人频道删除失败")
+
+
 async def _prompt_wolves(channel, guild, game):
     wolves = game.holders(ROLE_WOLF)
-    await _say(channel, "🐺 狼人请睁眼，正在私信里商量今晚刀谁……")
     targets = [p for p in game.alive() if not game.is_wolf(p)]
-    reachable = 0
     mates = "、".join(_name(guild, w) for w in wolves)
+
+    wolf_ch = await _create_wolf_channel(guild, channel, game)
+    if wolf_ch is not None:
+        _wolf_channels[game.channel_id] = wolf_ch
+        await _say(channel, "🐺 狼人请睁眼，去你们的私密频道商量今晚刀谁……")
+        view = WolfVoteView(game.channel_id, None, channel, guild, targets, shared=True)
+        await _say(wolf_ch, f"🐺 狼队：{mates}\n在这里讨论，然后**每个狼各自从下拉里投一刀**（平票随机）：", view)
+        return
+
+    # 回退：私信各自投
+    await _say(channel, "🐺 狼人请睁眼，正在私信里商量今晚刀谁……")
+    reachable = 0
     for wolf in wolves:
         view = WolfVoteView(game.channel_id, wolf, channel, guild, targets)
         if await _dm(guild, wolf, f"🐺 狼队：{mates}\n今晚刀谁？（所有狼投完票才生效，平票随机）", view):
@@ -290,40 +357,59 @@ class GuardView(_NightActionView):
         await self._finish(interaction, f"🛡️ 今晚你守护了 **{_name(self.guild, target)}**。")
 
 
-class WolfVoteView(_NightActionView):
-    expect_phase = "night_wolf"
+class WolfVoteView(View):
+    """狼刀投票。shared=True 发在狼人频道（任一存活狼可点）；否则私信给单个狼。"""
 
-    def __init__(self, channel_id, actor_id, channel, guild, targets):
-        super().__init__(channel_id, actor_id, channel, guild)
+    def __init__(self, channel_id, actor_id, channel, guild, targets, shared=False):
+        super().__init__(timeout=WEREWOLF_NIGHT_ACTION_TIME)
+        self.channel_id = channel_id
+        self.actor_id = actor_id
+        self.channel = channel
+        self.guild = guild
+        self.shared = shared
+        self.done = False
         self.children[0].options = _options(guild, targets)
+
+    async def on_timeout(self):
+        if self.done:
+            return
+        self.done = True
+        result = werewolf_service.skip_night_phase(self.channel_id, "night_wolf")
+        if "error" in result:
+            return
+        await _cleanup_wolf_channel(self.channel_id)
+        await advance_night(self.channel, self.guild, self.channel_id)
 
     @select(placeholder="今晚刀谁……", options=[])
     async def pick(self, interaction: discord.Interaction, select_: Select):
-        if interaction.user.id != self.actor_id:
+        uid = interaction.user.id
+        game = werewolf_service.get_game(self.channel_id)
+        if game is None or not game.is_wolf(uid) or uid in game.dead:
+            await interaction.response.send_message("只有存活的狼人能投刀。", ephemeral=True)
+            return
+        if not self.shared and uid != self.actor_id:
             await interaction.response.send_message("这不是你的界面。", ephemeral=True)
             return
         target = int(select_.values[0])
-        result = werewolf_service.wolf_vote(self.channel_id, self.actor_id, target)
+        result = werewolf_service.wolf_vote(self.channel_id, uid, target)
         if "error" in result:
             await interaction.response.send_message(result["error"], ephemeral=True)
             return
 
-        self.done = True
-        self.stop()
-        for c in self.children:
-            c.disabled = True
         if result.get("all_done"):
+            self.done = True
+            self.stop()
             final = result.get("target")
-            text = f"🐺 狼队最终决定刀 **{_name(self.guild, final)}**。"
-        else:
-            text = (f"🐺 你投了 **{_name(self.guild, target)}**"
-                    f"（{result['voted']}/{result['needed']} 已投，等队友）。")
-        try:
-            await interaction.response.edit_message(content=text, view=self)
-        except Exception:
-            log.exception("狼人杀狼刀回执编辑失败")
-        if result.get("all_done"):
+            try:
+                await interaction.response.send_message(f"🐺 狼队最终决定刀 **{_name(self.guild, final)}**。")
+            except Exception:
+                pass
+            await _cleanup_wolf_channel(self.channel_id)
             await advance_night(self.channel, self.guild, self.channel_id)
+        else:
+            await interaction.response.send_message(
+                f"🐺 你投了 **{_name(self.guild, target)}**"
+                f"（{result['voted']}/{result['needed']} 已投，等队友）。", ephemeral=True)
 
 
 class WitchView(_NightActionView):
@@ -444,18 +530,90 @@ async def announce_dawn(channel, guild, channel_id: int):
         text = f"☀️ **第 {game.day} 天** 天亮了。\n昨晚是**平安夜**，没有人死亡。"
     else:
         text = (f"☀️ **第 {game.day} 天** 天亮了。\n"
-                f"昨晚死亡：{', '.join(f'<@{p}>' for p in deaths)}（身份不公开）")
+                f"昨晚死亡：{'、'.join(_reveal(game, p) for p in deaths)}")
     await _say(channel, text)
 
     if result.get("game_over"):
         await finish_game(channel, guild, game, result)
         return
 
+    if result.get("sheriff_died"):
+        await _handle_sheriff_death(channel, guild, game, result["sheriff_died"])
+
     if result.get("pending_hunter"):
         await _prompt_hunter(channel, guild, game, result["pending_hunter"])
         return
 
-    await start_discussion(channel, guild, channel_id)
+    await enter_day(channel, guild, channel_id)
+
+
+async def enter_day(channel, guild, channel_id: int):
+    """第一天先选警长，其余天直接讨论。"""
+    game = werewolf_service.get_game(channel_id)
+    if game is None:
+        return
+    if WEREWOLF_ELECT_SHERIFF and game.day == 1 and not game.sheriff_done and len(game.alive()) >= 3:
+        await start_sheriff_election(channel, guild, channel_id)
+    else:
+        await start_discussion(channel, guild, channel_id)
+
+
+async def _handle_sheriff_death(channel, guild, game, sheriff_id: int):
+    """警长死亡：私信让他指定移交对象，拒绝/超时则销毁警徽。不阻塞主流程。"""
+    await _say(channel, f"👮 警长 <@{sheriff_id}> 出局了，正在私信里决定警徽移交给谁……")
+    candidates = [p for p in game.alive()]
+    view = SheriffTransferView(game.channel_id, sheriff_id, channel, guild, candidates)
+    if not await _dm(guild, sheriff_id, "👮 你是警长，要把警徽移交给谁？（不移交则销毁）", view):
+        werewolf_service.sheriff_transfer(game.channel_id, sheriff_id, None)
+        await _say(channel, "👮 警徽无人接收，已销毁。")
+
+
+class SheriffTransferView(View):
+    def __init__(self, channel_id, from_id, channel, guild, candidates):
+        super().__init__(timeout=WEREWOLF_SHERIFF_TRANSFER_TIME)
+        self.channel_id = channel_id
+        self.from_id = from_id
+        self.channel = channel
+        self.guild = guild
+        self.done = False
+        self.children[0].options = _options(guild, candidates)
+
+    async def on_timeout(self):
+        if self.done:
+            return
+        self.done = True
+        werewolf_service.sheriff_transfer(self.channel_id, self.from_id, None)
+        await _say(self.channel, "👮 警长没有及时移交，警徽销毁。")
+
+    @select(placeholder="警徽给谁……", options=[])
+    async def pick(self, interaction: discord.Interaction, select_: Select):
+        if interaction.user.id != self.from_id:
+            await interaction.response.send_message("这不是你的界面。", ephemeral=True)
+            return
+        target = int(select_.values[0])
+        r = werewolf_service.sheriff_transfer(self.channel_id, self.from_id, target)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content=f"👮 警徽移交给了 **{_name(self.guild, target)}**。", view=self)
+        await _say(self.channel, f"👮 警徽移交给了 <@{target}>！")
+
+    @button(label="不移交（销毁警徽）", style=discord.ButtonStyle.secondary, emoji="💥")
+    async def destroy(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.from_id:
+            await interaction.response.send_message("这不是你的界面。", ephemeral=True)
+            return
+        werewolf_service.sheriff_transfer(self.channel_id, self.from_id, None)
+        self.done = True
+        self.stop()
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="👮 你选择销毁警徽。", view=self)
+        await _say(self.channel, "👮 警长选择销毁警徽，本局不再有警长。")
 
 
 async def _prompt_hunter(channel, guild, game, hunter_id: int):
@@ -472,7 +630,7 @@ async def _continue_after_hunter(channel, guild, channel_id: int):
     if game is None:
         return
     if game.phase == "day_discuss":
-        await start_discussion(channel, guild, channel_id)
+        await enter_day(channel, guild, channel_id)
     elif game.phase.startswith("night_"):
         await advance_night(channel, guild, channel_id)
 
@@ -540,6 +698,271 @@ class HunterView(View):
         await self._resolve(interaction, None)
 
 
+# ============================ 警长竞选 ============================
+
+
+async def start_sheriff_election(channel, guild, channel_id: int):
+    game = werewolf_service.get_game(channel_id)
+    if game is None:
+        return
+    werewolf_service.begin_sheriff_election(game)
+    view = SheriffSignupView(channel_id, channel, guild)
+    view.message = await _say(channel, (
+        f"👮 **警长竞选** 存活玩家 {WEREWOLF_SHERIFF_SIGNUP_TIME} 秒内选择是否上警。\n"
+        f"警长白天放逐投票算 **1.5 票**。"
+    ), view=view)
+
+
+class SheriffSignupView(View):
+    def __init__(self, channel_id, channel, guild):
+        super().__init__(timeout=WEREWOLF_SHERIFF_SIGNUP_TIME)
+        self.channel_id = channel_id
+        self.channel = channel
+        self.guild = guild
+        self.finished = False
+        self.message: discord.Message | None = None
+
+    async def _close(self):
+        if self.finished:
+            return
+        self.finished = True
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        r = werewolf_service.close_signup(self.channel_id)
+        if r.get("no_sheriff"):
+            await _say(self.channel, "👮 没有人上警，本局无警长，直接进入讨论。")
+            await start_discussion(self.channel, self.guild, self.channel_id)
+        else:
+            cands = "、".join(_name(self.guild, c) for c in r["candidates"])
+            await _say(self.channel, f"👮 上警的有：{cands}。按顺序竞选发言。")
+            await _post_campaign_prompt(self.channel, self.guild, self.channel_id)
+
+    async def on_timeout(self):
+        await self._close()
+
+    @button(label="上警", style=discord.ButtonStyle.primary, emoji="👮")
+    async def run(self, interaction: discord.Interaction, button: Button):
+        r = werewolf_service.sheriff_signup(self.channel_id, interaction.user.id, True)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        await interaction.response.send_message("👮 你选择**上警**。", ephemeral=True)
+        await self._maybe_all_signed(r)
+
+    @button(label="不上警", style=discord.ButtonStyle.secondary, emoji="🙅")
+    async def stay(self, interaction: discord.Interaction, button: Button):
+        r = werewolf_service.sheriff_signup(self.channel_id, interaction.user.id, False)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        await interaction.response.send_message("🙅 你选择**不上警**。", ephemeral=True)
+        await self._maybe_all_signed(r)
+
+    async def _maybe_all_signed(self, r: dict):
+        if r.get("signed") and r.get("total") and r["signed"] >= r["total"]:
+            await self._close()
+
+
+async def _post_campaign_prompt(channel, guild, channel_id: int):
+    game = werewolf_service.get_game(channel_id)
+    if game is None or game.phase != "sheriff_campaign":
+        return
+    speaker = werewolf_service.campaign_current_speaker(game)
+    if speaker is None:
+        return
+    view = CampaignSpeakView(channel_id, speaker, channel, guild)
+    view.message = await _say(channel, (
+        f"🎤 候选人 <@{speaker}> 竞选发言，限时 {WEREWOLF_CAMPAIGN_SPEAK_TIME} 秒。"
+    ), view=view)
+
+
+async def _after_campaign(channel, guild, channel_id: int, result: dict):
+    if result.get("campaign_done"):
+        if result.get("no_sheriff"):
+            await _say(channel, "👮 候选人都退水了，本局无警长。")
+            await start_discussion(channel, guild, channel_id)
+        elif result.get("auto"):
+            await _say(channel, f"👮 只剩一名候选人，<@{result['sheriff']}> 自动当选警长！")
+            await start_discussion(channel, guild, channel_id)
+        elif result.get("vote"):
+            await _start_sheriff_vote(channel, guild, channel_id, result["candidates"])
+    else:
+        await _post_campaign_prompt(channel, guild, channel_id)
+
+
+class CampaignSpeakModal(Modal):
+    def __init__(self, channel_id, speaker_id, channel, guild, parent):
+        super().__init__(title="竞选发言", timeout=WEREWOLF_CAMPAIGN_SPEAK_TIME)
+        self.channel_id = channel_id
+        self.speaker_id = speaker_id
+        self.channel = channel
+        self.guild = guild
+        self.parent = parent
+        self.text = TextInput(label="拉票发言（会公开）", style=discord.TextStyle.paragraph,
+                              max_length=900, required=True)
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        r = werewolf_service.campaign_speak(self.channel_id, self.speaker_id, self.text.value)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        self.parent.done = True
+        self.parent.stop()
+        await interaction.response.send_message("✅ 已发言。", ephemeral=True)
+        await _say(self.channel, f"🎤 **候选人 <@{self.speaker_id}>**\n{r['text']}")
+        await _after_campaign(self.channel, self.guild, self.channel_id, r)
+
+
+class CampaignSpeakView(View):
+    def __init__(self, channel_id, speaker_id, channel, guild):
+        super().__init__(timeout=WEREWOLF_CAMPAIGN_SPEAK_TIME)
+        self.channel_id = channel_id
+        self.speaker_id = speaker_id
+        self.channel = channel
+        self.guild = guild
+        self.done = False
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        if self.done:
+            return
+        self.done = True
+        r = werewolf_service.campaign_skip(self.channel_id, self.speaker_id)
+        if "error" in r:
+            return
+        await _say(self.channel, f"⏰ <@{self.speaker_id}> 竞选超时未发言，跳过。")
+        await _after_campaign(self.channel, self.guild, self.channel_id, r)
+
+    @button(label="竞选发言", style=discord.ButtonStyle.primary, emoji="🎤")
+    async def speak(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.speaker_id:
+            await interaction.response.send_message("还没轮到你。", ephemeral=True)
+            return
+        if self.done:
+            await interaction.response.send_message("这一轮已经结束了。", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            CampaignSpeakModal(self.channel_id, self.speaker_id, self.channel, self.guild, self))
+
+    @button(label="退水", style=discord.ButtonStyle.danger, emoji="💧")
+    async def withdraw(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.speaker_id:
+            await interaction.response.send_message("只有当前发言的候选人能在此退水。", ephemeral=True)
+            return
+        r = werewolf_service.campaign_withdraw(self.channel_id, self.speaker_id)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="💧 你退水了，不再参与警长竞选。", view=self)
+        await _say(self.channel, f"💧 <@{self.speaker_id}> 退水，退出警长竞选。")
+        await _after_campaign(self.channel, self.guild, self.channel_id, r)
+
+
+async def _start_sheriff_vote(channel, guild, channel_id: int, candidates: list[int]):
+    cands = "、".join(_name(guild, c) for c in candidates)
+    view = SheriffVoteEntryView(channel_id, channel, guild)
+    view.message = await _say(channel, (
+        f"🗳️ **警长投票** 候选人：{cands}\n"
+        f"非候选人限时 {WEREWOLF_SHERIFF_VOTE_TIME} 秒私密投票，平票则警徽流失。"
+    ), view=view)
+
+
+class SheriffVoteEntryView(View):
+    def __init__(self, channel_id, channel, guild):
+        super().__init__(timeout=WEREWOLF_SHERIFF_VOTE_TIME)
+        self.channel_id = channel_id
+        self.channel = channel
+        self.guild = guild
+        self.finished = False
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        r = werewolf_service.force_sheriff_tally(self.channel_id)
+        if "error" in r:
+            return
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        await _announce_sheriff(self.channel, self.guild, self.channel_id, r)
+
+    @button(label="投警长", style=discord.ButtonStyle.primary, emoji="🗳️")
+    async def vote(self, interaction: discord.Interaction, button: Button):
+        game = werewolf_service.get_game(self.channel_id)
+        if game is None or game.phase != "sheriff_vote":
+            await interaction.response.send_message("现在不是警长投票阶段。", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if uid not in werewolf_service.sheriff_voters(game):
+            await interaction.response.send_message("候选人和出局者不能投警长。", ephemeral=True)
+            return
+        if uid in game.campaign["votes"]:
+            await interaction.response.send_message("你已经投过了。", ephemeral=True)
+            return
+        view = SheriffVoteView(self.channel_id, uid, self.channel, self.guild,
+                               werewolf_service._effective_candidates(game), self)
+        await interaction.response.send_message("🗳️ 投给哪个候选人？（只有你能看见）", view=view, ephemeral=True)
+
+
+class SheriffVoteView(View):
+    def __init__(self, channel_id, voter_id, channel, guild, candidates, entry):
+        super().__init__(timeout=WEREWOLF_SHERIFF_VOTE_TIME)
+        self.channel_id = channel_id
+        self.voter_id = voter_id
+        self.channel = channel
+        self.guild = guild
+        self.entry = entry
+        self.children[0].options = _options(guild, candidates)
+
+    @select(placeholder="选你支持的警长……", options=[])
+    async def pick(self, interaction: discord.Interaction, select_: Select):
+        if interaction.user.id != self.voter_id:
+            await interaction.response.send_message("这不是你的投票。", ephemeral=True)
+            return
+        target = int(select_.values[0])
+        r = werewolf_service.sheriff_vote(self.channel_id, self.voter_id, target)
+        if "error" in r:
+            await interaction.response.send_message(r["error"], ephemeral=True)
+            return
+        for c in self.children:
+            c.disabled = True
+        if r.get("sheriff_done"):
+            self.entry.finished = True
+            self.entry.stop()
+            await interaction.response.edit_message(content="✅ 已投票，等结果。", view=self)
+            await _announce_sheriff(self.channel, self.guild, self.channel_id, r)
+        else:
+            await interaction.response.edit_message(
+                content=f"✅ 已投 **{_name(self.guild, target)}**"
+                        f"（{r['votes_count']}/{r['needed']}），等其他人。", view=self)
+
+
+async def _announce_sheriff(channel, guild, channel_id: int, result: dict):
+    if result.get("sheriff"):
+        await _say(channel, f"👮 **<@{result['sheriff']}> 当选警长！** 白天投票算 1.5 票。")
+    elif result.get("tie"):
+        await _say(channel, "👮 警长投票平票，警徽流失，本局无警长。")
+    else:
+        await _say(channel, "👮 本局无警长。")
+    await start_discussion(channel, guild, channel_id)
+
+
 # ============================ 白天：轮流发言 ============================
 
 
@@ -550,6 +973,7 @@ async def start_discussion(channel, guild, channel_id: int):
         return
     if game.phase != "day_discuss" or not game.speak_order:
         werewolf_service.begin_discussion(game)
+    await _set_mute(guild, channel, True)
     order = "　".join(f"{i + 1}.{_name(guild, p)}" for i, p in enumerate(game.speak_order))
     await _say(channel, (
         f"🗣️ **讨论环节** 按顺序轮流发言，每人 {WEREWOLF_SPEAK_TIME} 秒。\n"
@@ -675,6 +1099,7 @@ async def start_voting(channel, guild, channel_id: int):
     game = werewolf_service.get_game(channel_id)
     if game is None:
         return
+    await _set_mute(guild, channel, False)
     if game.phase != "day_vote":
         werewolf_service.enter_voting(game)
     view = VoteEntryView(channel_id, channel, guild)
@@ -778,7 +1203,7 @@ async def announce_vote(channel, guild, channel_id: int, result: dict):
     elif result.get("tie"):
         text += "\n\n🤝 平票！这不是 bug——按规则本轮无人淘汰，直接入夜。"
     elif result.get("eliminated"):
-        text += f"\n\n⚰️ <@{result['eliminated']}> 被投票出局（身份不公开）。"
+        text += f"\n\n⚰️ {_reveal(game, result['eliminated'])} 被投票出局。"
     else:
         text += "\n\n本轮无人淘汰。"
 
@@ -788,6 +1213,9 @@ async def announce_vote(channel, guild, channel_id: int, result: dict):
         if game is not None:
             await finish_game(channel, guild, game, result)
         return
+
+    if result.get("sheriff_died") and game is not None:
+        await _handle_sheriff_death(channel, guild, game, result["sheriff_died"])
 
     if result.get("pending_hunter"):
         await _prompt_hunter(channel, guild, game, result["pending_hunter"])
@@ -819,4 +1247,6 @@ async def finish_game(channel, guild, game, result: dict):
         if settle["deduct_failed"]:
             lines.append(f"⚠️ {', '.join(f'<@{p}>' for p in settle['deduct_failed'])} 局费扣款失败，已跳过。")
 
+    await _set_mute(guild, channel, False)
+    await _cleanup_wolf_channel(game.channel_id)
     await _say(channel, "\n".join(lines))

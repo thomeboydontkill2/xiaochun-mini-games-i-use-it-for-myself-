@@ -300,3 +300,22 @@ WEREWOLF_GUARD_CAN_PROTECT_SELF = True    # 守卫能否自守
 WEREWOLF_SAVE_AND_GUARD_KILLS = True      # 同守同救是否判死（True=经典"奶穿"，False=救活）
 WEREWOLF_TIE_ELIMINATES_NOBODY = True     # 投票平票是否不淘汰（True=直接入夜）
 WEREWOLF_IDIOT_KEEPS_VOTE = False         # 白痴翻牌后能否继续投票（经典：不能）
+
+# ===== 狼人杀·警长 / 禁言 / 狼人频道（追加段）=====
+
+WEREWOLF_ELECT_SHERIFF = True          # 是否启用警长竞选
+WEREWOLF_SHERIFF_VOTE_WEIGHT = 1.5     # 警长在白天放逐投票里的票权
+WEREWOLF_CAMPAIGN_SPEAK_TIME = 30      # 竞选发言单人时限（秒）
+WEREWOLF_SHERIFF_VOTE_TIME = 60        # 警长投票时限（秒）
+WEREWOLF_SHERIFF_SIGNUP_TIME = 30      # 上警/不上警报名时限（秒）
+WEREWOLF_SHERIFF_TRANSFER_TIME = 30    # 警长死亡移交警徽时限（秒）
+
+# 讨论阶段禁言：填入普通玩家所属身份组 ID（int），None 则不禁言。
+# 需要机器人身份组有「管理身份组」权限，且排在该身份组之上。
+WEREWOLF_MUTE_ROLE_ID: int | None = None
+WEREWOLF_MUTE_DURING_DISCUSSION = True
+
+# 狼人私密频道：建在哪个分类（category）下；None 则建在触发频道同分类。
+# 需要机器人有「管理频道」权限。创建失败会自动回退到私信投票模式。
+WEREWOLF_WOLF_CHANNEL_CATEGORY_ID: int | None = None
+WEREWOLF_USE_WOLF_CHANNEL = True

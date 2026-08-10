@@ -7,6 +7,7 @@
       → night_guard → night_wolf → night_witch → night_seer   （夜晚，按序，无人存活的角色自动跳过）
       → day_announce（公示夜间死者）
       → day_hunter（若猎人夜死且非被毒，等待开枪）
+      → [sheriff_signup → sheriff_campaign → sheriff_vote]     （仅第一天，可选）
       → day_discuss（轮流发言）
       → day_vote（私密投票）
       → day_vote_hunter（若猎人被投出，等待开枪）
@@ -21,6 +22,8 @@
 - 猎人被毒死不能开枪；被刀/被投出可以开枪。
 - 白痴被投出翻牌但不死，之后默认失去投票权。
 - 投票平票默认不淘汰，直接入夜。
+- 警长仅第一天竞选：简单多数当选，警长白天放逐投票算 1.5 票；平票警徽流失；
+  警长死亡可移交警徽给存活的另一人，拒绝/超时则销毁。
 """
 
 import random
@@ -31,7 +34,7 @@ from src.chat.features.games.config.games_config import (
     ROLE_WOLF, ROLE_VILLAGER, ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_GUARD, ROLE_IDIOT,
     WEREWOLF_GUARD_SAME_TARGET_TWICE, WEREWOLF_GUARD_CAN_PROTECT_SELF,
     WEREWOLF_SAVE_AND_GUARD_KILLS, WEREWOLF_TIE_ELIMINATES_NOBODY,
-    WEREWOLF_IDIOT_KEEPS_VOTE,
+    WEREWOLF_IDIOT_KEEPS_VOTE, WEREWOLF_ELECT_SHERIFF, WEREWOLF_SHERIFF_VOTE_WEIGHT,
 )
 from src.chat.features.games.services import betting
 from src.chat.features.games.services.registry import GameRegistry
@@ -83,6 +86,12 @@ class WerewolfGame:
         self.settled = False
         self.winner: str | None = None
 
+        # 警长
+        self.sheriff_id: int | None = None
+        self.sheriff_done: bool = False            # 本局是否已经进行过警长竞选
+        self.campaign: dict = {}             # 竞选过程数据
+        self.pending_sheriff_transfer: int | None = None  # 待移交警徽的（已死）警长
+
     # --- 便捷查询 ---
 
     def alive(self) -> list[int]:
@@ -104,6 +113,18 @@ class WerewolfGame:
 
     def voters(self) -> list[int]:
         return [p for p in self.alive() if self.can_vote(p)]
+
+    def vote_weight(self, uid: int) -> float:
+        return WEREWOLF_SHERIFF_VOTE_WEIGHT if uid == self.sheriff_id else 1.0
+
+    def role_summary(self) -> str:
+        """本局角色构成的数量统计（不点名具体是谁）。"""
+        counts: dict[str, int] = {}
+        for r in self.roles.values():
+            counts[r] = counts.get(r, 0) + 1
+        order = [ROLE_WOLF, ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_GUARD, ROLE_IDIOT, ROLE_VILLAGER]
+        parts = [f"{r}×{counts[r]}" for r in order if counts.get(r)]
+        return " / ".join(parts)
 
 
 def assign_roles(count: int) -> list[str]:
@@ -365,6 +386,11 @@ class WerewolfService:
         game.death_causes = causes
         game.phase = "day_announce"
 
+        sheriff_died = game.sheriff_id if game.sheriff_id in deaths else None
+        if sheriff_died is not None:
+            game.pending_sheriff_transfer = sheriff_died
+            game.sheriff_id = None
+
         winner = self.check_winner(game)
         if winner:
             return self._end_game(game, winner, deaths=deaths, causes=causes)
@@ -385,6 +411,7 @@ class WerewolfService:
         return {
             "deaths": deaths, "causes": causes, "day": game.day,
             "phase": game.phase, "pending_hunter": game.pending_hunter,
+            "sheriff_died": sheriff_died,
             "game_over": False,
         }
 
@@ -401,6 +428,7 @@ class WerewolfService:
         game.hunter_used = True
 
         shot = None
+        sheriff_died = None
         if target is not None:
             if target not in game.alive():
                 game.pending_hunter = uid
@@ -408,16 +436,191 @@ class WerewolfService:
                 return {"error": "目标无效"}
             game.dead.append(target)
             shot = target
+            if target == game.sheriff_id:
+                sheriff_died = target
+                game.pending_sheriff_transfer = target
+                game.sheriff_id = None
 
         winner = self.check_winner(game)
         if winner:
-            return self._end_game(game, winner, shot=shot)
+            return self._end_game(game, winner, shot=shot, sheriff_died=sheriff_died)
 
         if was_vote_phase:
             self._next_day(game)
         else:
             self.begin_discussion(game)
-        return {"ok": True, "shot": shot, "phase": game.phase, "game_over": False}
+        return {"ok": True, "shot": shot, "sheriff_died": sheriff_died,
+                "phase": game.phase, "game_over": False}
+
+    # --- 警长竞选 ---
+
+    def begin_sheriff_election(self, game: WerewolfGame) -> dict:
+        game.sheriff_done = True
+        game.campaign = {
+            "signed": {},           # uid -> True(上警)/False(不上警)
+            "candidates": [],       # 上警者顺序
+            "withdrawn": set(),     # 退水者
+            "idx": 0,               # 竞选发言指针
+            "speeches": [],
+            "votes": {},            # voter -> target
+        }
+        game.phase = "sheriff_signup"
+        return {"phase": game.phase, "eligible": game.alive()}
+
+    def sheriff_signup(self, channel_id: int, uid: int, run: bool) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_signup":
+            return {"error": "现在不是上警报名阶段"}
+        if uid not in game.alive():
+            return {"error": "你不在场或已出局"}
+        if uid in game.campaign["signed"]:
+            return {"error": "你已经选过了"}
+        game.campaign["signed"][uid] = bool(run)
+        return {"ok": True, "run": bool(run),
+                "signed": len(game.campaign["signed"]), "total": len(game.alive())}
+
+    def close_signup(self, channel_id: int) -> dict:
+        """报名结束：确定候选人。0 人上警→无警长直接讨论；否则进入竞选发言。"""
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_signup":
+            return {"error": "现在不是上警报名阶段"}
+        candidates = [u for u in game.alive() if game.campaign["signed"].get(u)]
+        game.campaign["candidates"] = candidates
+        if not candidates:
+            self.begin_discussion(game)
+            return {"no_sheriff": True, "reason": "没有人上警", "phase": game.phase}
+        game.campaign["idx"] = 0
+        game.phase = "sheriff_campaign"
+        return {"candidates": candidates, "speaker": self.campaign_current_speaker(game),
+                "phase": game.phase}
+
+    def campaign_current_speaker(self, game: WerewolfGame) -> int | None:
+        c = game.campaign
+        while c["idx"] < len(c["candidates"]):
+            cand = c["candidates"][c["idx"]]
+            if cand not in game.dead and cand not in c["withdrawn"]:
+                return cand
+            c["idx"] += 1
+        return None
+
+    def campaign_withdraw(self, channel_id: int, uid: int) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_campaign":
+            return {"error": "现在不是竞选阶段"}
+        if uid not in game.campaign["candidates"] or uid in game.campaign["withdrawn"]:
+            return {"error": "你不在竞选里"}
+        game.campaign["withdrawn"].add(uid)
+        # 若正好轮到他发言，指针前移
+        if self.campaign_current_speaker(game) == uid:
+            game.campaign["idx"] += 1
+        return self._after_campaign_step(game, withdrew=uid)
+
+    def campaign_speak(self, channel_id: int, uid: int, text: str) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_campaign":
+            return {"error": "现在不是竞选阶段"}
+        if self.campaign_current_speaker(game) != uid:
+            return {"error": "还没轮到你发言"}
+        text = (text or "").strip()[:900]
+        if not text:
+            return {"error": "发言不能是空的"}
+        game.campaign["speeches"].append((uid, text))
+        game.campaign["idx"] += 1
+        return self._after_campaign_step(game, spoke=uid, text=text)
+
+    def campaign_skip(self, channel_id: int, uid: int) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_campaign":
+            return {"error": "现在不是竞选阶段"}
+        if self.campaign_current_speaker(game) != uid:
+            return {"error": "发言人已经变了"}
+        game.campaign["idx"] += 1
+        return self._after_campaign_step(game, spoke=uid, skipped=True)
+
+    def _after_campaign_step(self, game: WerewolfGame, spoke=None, text=None,
+                             skipped=False, withdrew=None) -> dict:
+        nxt = self.campaign_current_speaker(game)
+        result = {"ok": True, "spoke": spoke, "text": text, "skipped": skipped, "withdrew": withdrew}
+        if nxt is None:
+            return {**result, "campaign_done": True, **self._begin_sheriff_vote(game)}
+        return {**result, "campaign_done": False, "next_speaker": nxt, "phase": game.phase}
+
+    def _effective_candidates(self, game: WerewolfGame) -> list[int]:
+        c = game.campaign
+        return [u for u in c["candidates"] if u not in game.dead and u not in c["withdrawn"]]
+
+    def _begin_sheriff_vote(self, game: WerewolfGame) -> dict:
+        cands = self._effective_candidates(game)
+        if not cands:
+            self.begin_discussion(game)
+            return {"no_sheriff": True, "reason": "候选人都退水了", "phase": game.phase}
+        if len(cands) == 1:
+            game.sheriff_id = cands[0]
+            self.begin_discussion(game)
+            return {"sheriff": cands[0], "auto": True, "phase": game.phase}
+        game.phase = "sheriff_vote"
+        game.campaign["votes"] = {}
+        return {"candidates": cands, "phase": game.phase, "vote": True}
+
+    def sheriff_voters(self, game: WerewolfGame) -> list[int]:
+        """非候选人的存活玩家投票选警长。"""
+        return [u for u in game.alive() if u not in game.campaign["candidates"]]
+
+    def sheriff_vote(self, channel_id: int, voter: int, target: int) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_vote":
+            return {"error": "现在不是警长投票阶段"}
+        if voter not in self.sheriff_voters(game):
+            return {"error": "候选人和出局者不能投票"}
+        if voter in game.campaign["votes"]:
+            return {"error": "你已经投过票了"}
+        if target not in self._effective_candidates(game):
+            return {"error": "目标不是有效候选人"}
+        game.campaign["votes"][voter] = target
+        needed = len(self.sheriff_voters(game))
+        if len(game.campaign["votes"]) >= needed:
+            return self._sheriff_tally(game)
+        return {"ok": True, "votes_count": len(game.campaign["votes"]), "needed": needed}
+
+    def force_sheriff_tally(self, channel_id: int) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game or game.phase != "sheriff_vote":
+            return {"error": "现在不是警长投票阶段"}
+        return self._sheriff_tally(game, forced=True)
+
+    def _sheriff_tally(self, game: WerewolfGame, forced: bool = False) -> dict:
+        counts: dict[int, int] = {}
+        for t in game.campaign["votes"].values():
+            counts[t] = counts.get(t, 0) + 1
+        elected = None
+        tie = False
+        if counts:
+            top = max(counts.values())
+            winners = [t for t, c in counts.items() if c == top]
+            if len(winners) == 1:
+                elected = winners[0]
+            else:
+                tie = True
+        if elected is not None:
+            game.sheriff_id = elected
+        self.begin_discussion(game)
+        return {"sheriff_done": True, "sheriff": elected, "tie": tie,
+                "vote_count": counts, "forced": forced, "phase": game.phase}
+
+    # --- 警徽移交 ---
+
+    def sheriff_transfer(self, channel_id: int, from_uid: int, to_uid: int | None) -> dict:
+        game = self._active_games.get(channel_id)
+        if not game:
+            return {"error": "没有对局"}
+        if game.pending_sheriff_transfer != from_uid:
+            return {"error": "现在没有你要移交的警徽"}
+        game.pending_sheriff_transfer = None
+        if to_uid is None or to_uid not in game.alive():
+            game.sheriff_id = None
+            return {"ok": True, "transferred_to": None, "destroyed": True}
+        game.sheriff_id = to_uid
+        return {"ok": True, "transferred_to": to_uid, "destroyed": False}
 
     # --- 白天：轮流发言 ---
 
@@ -509,9 +712,9 @@ class WerewolfService:
         return self._tally(game, forced=True)
 
     def _tally(self, game: WerewolfGame, forced: bool = False) -> dict:
-        counts: dict[int, int] = {}
-        for t in game.votes.values():
-            counts[t] = counts.get(t, 0) + 1
+        counts: dict[int, float] = {}
+        for voter, t in game.votes.items():
+            counts[t] = counts.get(t, 0) + game.vote_weight(voter)
         game.votes = {}
 
         eliminated = None
@@ -545,6 +748,10 @@ class WerewolfService:
             }
 
         game.dead.append(eliminated)
+        if eliminated == game.sheriff_id:
+            base["sheriff_died"] = eliminated
+            game.pending_sheriff_transfer = eliminated
+            game.sheriff_id = None
         winner = self.check_winner(game)
         if winner:
             return {**self._end_game(game, winner), **base, "eliminated": eliminated}
