@@ -110,29 +110,29 @@ class RouletteCog(commands.Cog):
         if final.get("life_gamble"):
             if final.get("muted"):
                 await interaction.followup.send(
-                    prefix + f"💥 赌命失败！小春娘不理你 {final['muted']} 分钟，好好反省。<生气>")
+                    prefix + f"💥 赌命失败！小春娘不理你 {final['muted']} 分钟，好好反省。<:angry:1536137006050975815>")
             elif multiplier == 0:
                 await interaction.followup.send(
-                    prefix + "😐 赌命回本！这次放过你，币没扣也没奖。<微笑>")
+                    prefix + "😐 赌命回本！这次放过你，币没扣也没奖。<:xianhua:1536148788228522075>")
             elif final.get("reward_capped"):
                 await interaction.followup.send(
-                    prefix + "🎉 赌命成功！但你今天的赌命奖励已经领满了，只赢了面子。<鬼脸>")
+                    prefix + "🎉 赌命成功！但你今天的赌命奖励已经领满了，只赢了面子。<:ghost_face:1536141788065038468>")
             else:
                 await interaction.followup.send(
-                    prefix + f"🎉 赌命成功！勇敢者奖励 **+{final['reward']}** 春春币！<得意>")
+                    prefix + f"🎉 赌命成功！勇敢者奖励 **+{final['reward']}** 春春币！<:ao_jiao:1536137032932532254>")
             return
 
         if final.get("muted"):
             await interaction.followup.send(
-                prefix + f"😶 小春娘罚你闭嘴 {final['muted']} 分钟，币没扣，反省一下。<鬼脸>")
+                prefix + f"😶 小春娘罚你闭嘴 {final['muted']} 分钟，币没扣，反省一下。<:ghost_face:1536141788065038468>")
         elif multiplier < 0:
             await interaction.followup.send(
-                prefix + f"💸 亏了 {final['loss']} 春春币（扣 {int(abs(multiplier) * 100)}%）。下次再来。<委屈>")
+                prefix + f"💸 亏了 {final['loss']} 春春币（扣 {int(abs(multiplier) * 100)}%）。下次再来。<:wei_qu:1536146943493800077>")
         elif multiplier == 0:
-            await interaction.followup.send(prefix + "😐 不亏不赚，币保住了。<微笑>")
+            await interaction.followup.send(prefix + "😐 不亏不赚，币保住了。<:xianhua:1536148788228522075>")
         else:
             await interaction.followup.send(
-                prefix + f"💰 赢了！净收益 **+{final['coins_change']}** 春春币。<开心>")
+                prefix + f"💰 赢了！净收益 **+{final['coins_change']}** 春春币。<:kai_xin:1536137054306705599>")
 
 
 async def setup(bot: commands.Bot):

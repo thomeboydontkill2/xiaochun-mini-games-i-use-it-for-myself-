@@ -40,7 +40,7 @@ class RouletteView(View):
             await interaction.response.send_message("这不是你的轮盘哦。", ephemeral=True)
             return
         if self.spun:
-            await interaction.response.send_message("已经在转了，别催。<鬼脸>", ephemeral=True)
+            await interaction.response.send_message("已经在转了，别催。<:ghost_face:1536141788065038468>", ephemeral=True)
             return
         self.spun = True
         for b in self.children:

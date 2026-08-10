@@ -7,12 +7,19 @@
 - 投票超时不再卡死游戏：View 超时自动按已有票强制结算并公屏公告。
 - 招募超时自动取消对局。
 - 平票文案明确说明"不是 bug，本轮无人淘汰，游戏继续"。
+- 【关键修复】"开始游戏"点了没反应：旧版先给所有玩家挨个发私信、发完才更新公屏，
+  私信一慢就超过 Discord 交互 3 秒响应窗口，导致公屏更新静默失败、其他人毫无察觉。
+  现在改为先响应更新公屏，私信放到响应之后再发，且公屏更新失败会退到频道直发兜底。
 """
+
+import logging
 
 import discord
 from discord.ui import View, Select, Button, Modal, TextInput, select, button
 
 from src.chat.features.games.config.games_config import UNDERCOVER_VOTE_TIME, UNDERCOVER_DESC_TIME
+
+log = logging.getLogger(__name__)
 
 
 def _member_name(guild, uid: int) -> str:
@@ -60,12 +67,18 @@ async def _announce_tally(channel, guild, channel_id: int, result: dict):
             settle = await undercover_service.settle(game, result["winner"], guild)
             if not settle.get("error"):
                 text += "\n结算完成，春春币/禁言已生效。"
-        await channel.send(text)
+        try:
+            await channel.send(text)
+        except Exception:
+            log.exception("谁是卧底终局公告发送失败")
     else:
         next_round = result.get("next_round", 1)
         text += f"\n\n**第{next_round}轮描述**开始，点下方按钮填写描述 👇"
         desc_view = UndercoverDescView(channel_id, next_round)
-        desc_view.message = await channel.send(text, view=desc_view)
+        try:
+            desc_view.message = await channel.send(text, view=desc_view)
+        except Exception:
+            log.exception("谁是卧底下一轮描述界面发送失败")
 
 
 class UndercoverJoinView(View):
@@ -105,8 +118,7 @@ class UndercoverJoinView(View):
         if interaction.user.id != self.host_id:
             await interaction.response.send_message("只有发起人能开始。", ephemeral=True)
             return
-        from src.chat.features.games.services.undercover_service import undercover_service, WORD_DM_MESSAGES
-        import random as _random
+        from src.chat.features.games.services.undercover_service import undercover_service
         ok, msg, game = undercover_service.start_game(self.channel_id)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True)
@@ -114,6 +126,40 @@ class UndercoverJoinView(View):
         self.started = True
         for c in self.children:
             c.disabled = True
+
+        # 【关键修复】先在 3 秒窗口内响应交互、把公屏切到描述界面，
+        # 私信是慢操作（多人、可能限速），必须放到响应之后再做，
+        # 否则交互令牌超时会导致这一步整体静默失败，公屏什么都不会变。
+        content = (
+            f"🎭 **谁是卧底开始！**\n"
+            f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
+            f"私信正在发送中，收到词之前也可以先点「查看我的词」偷看。\n\n"
+            f"**第{game.current_round}轮描述**\n"
+            f"点下方按钮填写你的描述（只有你能看见的输入框），全员提交后统一展示！"
+        )
+        desc_view = UndercoverDescView(self.channel_id, game.current_round)
+
+        try:
+            await interaction.response.edit_message(content=content, view=desc_view)
+            desc_view.message = await interaction.original_response()
+        except Exception:
+            log.exception("谁是卧底开局公屏更新失败，尝试频道直发兜底")
+            channel = interaction.channel
+            if channel is not None:
+                try:
+                    desc_view.message = await channel.send(content, view=desc_view)
+                except Exception:
+                    log.exception("谁是卧底开局兜底发送也失败")
+                    return
+            else:
+                return
+
+        await self._send_word_dms(interaction, desc_view.message, game)
+
+    async def _send_word_dms(self, interaction: discord.Interaction, desc_message, game) -> None:
+        """公屏界面已经发出去之后再发私信，DM 慢/失败都不影响游戏能开始。"""
+        from src.chat.features.games.services.undercover_service import WORD_DM_MESSAGES
+        import random as _random
 
         dm_failed: list[int] = []
         for pid in game.players:
@@ -127,24 +173,14 @@ class UndercoverJoinView(View):
             except Exception:
                 dm_failed.append(pid)
 
-        content = (
-            f"🎭 **谁是卧底开始！**\n"
-            f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
-            f"每人已私信收到自己的词，别直接说出来！\n"
-        )
-        if dm_failed:
-            content += (
-                f"⚠️ {', '.join(f'<@{p}>' for p in dm_failed)} 私信发不出去（可能关了 DM），"
-                f"点下方「查看我的词」偷偷看。\n"
-            )
-        content += (
-            f"\n**第{game.current_round}轮描述**\n"
-            f"点下方按钮填写你的描述（只有你能看见的输入框），全员提交后统一展示！"
-        )
-
-        desc_view = UndercoverDescView(self.channel_id, game.current_round)
-        await interaction.response.edit_message(content=content, view=desc_view)
-        desc_view.message = await interaction.original_response()
+        if dm_failed and desc_message is not None:
+            try:
+                await desc_message.reply(
+                    f"⚠️ {', '.join(f'<@{p}>' for p in dm_failed)} 私信发不出去（可能关了 DM），"
+                    f"点「查看我的词」偷偷看。",
+                )
+            except discord.HTTPException:
+                log.exception("谁是卧底 DM 失败提示发送也失败")
 
     async def _join(self, interaction: discord.Interaction, is_life: bool):
         from src.chat.features.games.services.undercover_service import undercover_service
@@ -207,7 +243,7 @@ class UndercoverDescModal(Modal):
         else:
             await interaction.response.send_message(
                 f"✅ 描述已提交（{result['submitted_count']}/{result['total']}）。"
-                f"等其他人也填好，小春娘会统一展示。<乖巧>",
+                f"等其他人也填好，小春娘会统一展示。<:guai_qiao:1536143570120085655>",
                 ephemeral=True,
             )
 
@@ -293,7 +329,7 @@ class UndercoverVoteEntryView(View):
         view = UndercoverVoteView(self.channel_id, interaction.user.id, self)
         view.children[0].options = options
         await interaction.response.send_message(
-            content="🗳️ 选择你认为是卧底的人（只有你能看见）<偷笑>",
+            content="🗳️ 选择你认为是卧底的人（只有你能看见）<:tou_xiao:1536150632426111078>",
             view=view,
             ephemeral=True,
         )
@@ -336,6 +372,6 @@ class UndercoverVoteView(View):
         else:
             await interaction.response.edit_message(
                 content=f"🗳️ 已投票（{result['votes_count']}/{result['needed']}），"
-                        f"等其他人投完，结果会公屏展示。<乖巧>",
+                        f"等其他人投完，结果会公屏展示。<:guai_qiao:1536143570120085655>",
                 view=self,
             )

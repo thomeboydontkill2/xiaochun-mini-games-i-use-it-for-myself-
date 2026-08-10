@@ -62,7 +62,7 @@ class DuelReadyView(View):
             if self.message:
                 try:
                     await self.message.edit(
-                        content="⚔️ 死斗超时流局：有人迟迟不出拳，小春娘把擂台收了。币没有变动。<鄙视>",
+                        content="⚔️ 死斗超时流局：有人迟迟不出拳，小春娘把擂台收了。币没有变动。<:bi_shi:1536138114366701698>",
                         view=self,
                     )
                 except discord.HTTPException:
@@ -76,10 +76,10 @@ class DuelReadyView(View):
             await interaction.response.send_message("你不在这场死斗里。", ephemeral=True)
             return
         if (uid == game.p1_id and game.p1_choice) or (uid == game.p2_id and game.p2_choice):
-            await interaction.response.send_message("你这局已经出过了，等对手。<微笑>", ephemeral=True)
+            await interaction.response.send_message("你这局已经出过了，等对手。<:xianhua:1536148788228522075>", ephemeral=True)
             return
         await interaction.response.send_message(
-            content=f"⚔️ **第{self.round_num}局** 出拳吧！只有你能看见这个界面。<鬼脸>",
+            content=f"⚔️ **第{self.round_num}局** 出拳吧！只有你能看见这个界面。<:ghost_face:1536141788065038468>",
             view=DuelSelectView(self.game, uid, self.round_num),
             ephemeral=True,
         )
