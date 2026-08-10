@@ -26,6 +26,9 @@ from src.chat.features.games.services import betting
 from src.chat.features.games.services.werewolf_service import (
     werewolf_service, ROLE_INTROS,
 )
+from src.chat.features.games.ui.embed_utils import (
+    game_embed, COLOR_PLAYING, COLOR_WIN, COLOR_LOSE, COLOR_DRAW, COLOR_MUTE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -67,15 +70,15 @@ async def _set_mute(guild, channel, mute: bool):
         log.exception("狼人杀改禁言权限失败（检查机器人「管理身份组」权限）")
 
 
-async def _say(channel, content: str, view: View | None = None):
+async def _say(channel, content: str = "", embed: discord.Embed | None = None, view: View | None = None):
     """公屏播报，失败记日志并返回 None，绝不抛到调用方把流程打断。"""
     if channel is None:
         log.error("狼人杀播报失败：没有频道对象")
         return None
     try:
-        return await channel.send(content, view=view)
+        return await channel.send(content=content or None, embed=embed, view=view)
     except Exception:
-        log.exception("狼人杀公屏播报失败：%s", content[:80])
+        log.exception("狼人杀公屏播报失败")
         return None
 
 
@@ -112,7 +115,13 @@ class WerewolfJoinView(View):
             c.disabled = True
         if self.message:
             try:
-                await self.message.edit(content="🐺 招募超时，这局狼人杀取消了。人齐了再开～", view=self)
+                timeout_embed = game_embed(
+                    title="🐺 招募超时",
+                    description="这局狼人杀取消了。人齐了再开～",
+                    color=COLOR_DRAW,
+                    footer=f"房间 #{self.channel_id}",
+                )
+                await self.message.edit(embed=timeout_embed, content=None, view=self)
             except discord.HTTPException:
                 pass
 
@@ -153,15 +162,18 @@ class WerewolfJoinView(View):
         for c in self.children:
             c.disabled = True
 
-        await interaction.response.edit_message(
-            content=(
-                f"🐺 **狼人杀开局！** 共 {len(game.players)} 人\n"
+        start_embed = game_embed(
+            title="🐺 狼人杀开局！",
+            description=(
+                f"共 {len(game.players)} 人\n"
                 f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
                 f"📋 本局配置：**{game.role_summary()}**\n"
                 f"身份正在私信发送中……"
             ),
-            view=None,
+            color=COLOR_PLAYING,
+            footer=f"房间 #{self.channel_id}",
         )
+        await interaction.response.edit_message(embed=start_embed, content=None, view=None)
         channel = interaction.channel
         guild = interaction.guild
 
@@ -529,11 +541,18 @@ async def announce_dawn(channel, guild, channel_id: int):
 
     deaths = result.get("deaths") or []
     if not deaths:
-        text = f"☀️ **第 {game.day} 天** 天亮了。\n昨晚是**平安夜**，没有人死亡。"
+        dawn_desc = f"第 {game.day} 天 天亮了。\n昨晚是**平安夜**，没有人死亡。"
+        dawn_color = COLOR_PLAYING
     else:
-        text = (f"☀️ **第 {game.day} 天** 天亮了。\n"
-                f"昨晚死亡：{'、'.join(_reveal(game, p) for p in deaths)}")
-    await _say(channel, text)
+        dawn_desc = f"第 {game.day} 天 天亮了。\n昨晚死亡：{'、'.join(_reveal(game, p) for p in deaths)}"
+        dawn_color = COLOR_LOSE
+    dawn_embed = game_embed(
+        title="☀️ 天亮了",
+        description=dawn_desc,
+        color=dawn_color,
+        footer=f"房间 #{channel_id}",
+    )
+    await _say(channel, embed=dawn_embed)
 
     if result.get("game_over"):
         await finish_game(channel, guild, game, result)
@@ -1195,21 +1214,28 @@ class VoteView(View):
 async def announce_vote(channel, guild, channel_id: int, result: dict):
     game = werewolf_service.get_game(channel_id)
     lines = [f"{_name(guild, tid)}：{cnt} 票" for tid, cnt in (result.get("vote_count") or {}).items()]
-    text = "🗳️ **投票结束**\n" + ("\n".join(lines) if lines else "一票都没有……")
+    desc = "\n".join(lines) if lines else "一票都没有……"
+    title = "🗳️ 投票结束"
+    color = COLOR_PLAYING
     if result.get("forced"):
-        text = "⏰ 投票超时，按已有票数结算。\n" + text
+        title = "⏰ 投票超时"
+        desc = "按已有票数结算。\n" + desc
 
     if result.get("idiot_revealed"):
-        text += (f"\n\n🤪 <@{result['idiot_revealed']}> 是**白痴**！翻牌但不出局，"
+        desc += (f"\n\n🤪 <@{result['idiot_revealed']}> 是**白痴**！翻牌但不出局，"
                  f"之后不能再投票。本轮无人淘汰。")
+        color = COLOR_DRAW
     elif result.get("tie"):
-        text += "\n\n🤝 平票！这不是 bug——按规则本轮无人淘汰，直接入夜。"
+        desc += "\n\n🤝 平票！这不是 bug——按规则本轮无人淘汰，直接入夜。"
+        color = COLOR_DRAW
     elif result.get("eliminated"):
-        text += f"\n\n⚰️ {_reveal(game, result['eliminated'])} 被投票出局。"
+        desc += f"\n\n⚰️ {_reveal(game, result['eliminated'])} 被投票出局。"
+        color = COLOR_LOSE
     else:
-        text += "\n\n本轮无人淘汰。"
+        desc += "\n\n本轮无人淘汰。"
 
-    await _say(channel, text)
+    vote_embed = game_embed(title=title, description=desc, color=color, footer=f"房间 #{channel_id}")
+    await _say(channel, embed=vote_embed)
 
     if result.get("game_over"):
         if game is not None:
@@ -1232,8 +1258,13 @@ async def announce_vote(channel, guild, channel_id: int, result: dict):
 async def finish_game(channel, guild, game, result: dict):
     winner = result.get("winner")
     roles = result.get("roles") or dict(game.roles)
-    banner = "🎉 **好人阵营胜利！**" if winner == "good" else "🐺 **狼人阵营胜利！**"
-    lines = [banner, "", "**身份公布**"]
+    if winner == "good":
+        banner = "🎉 好人阵营胜利！"
+        color = COLOR_WIN
+    else:
+        banner = "🐺 狼人阵营胜利！"
+        color = COLOR_LOSE
+    lines = ["**身份公布**"]
     for pid, role in roles.items():
         mark = "☠️" if pid in game.dead else "🙂"
         lines.append(f"{mark} {_name(guild, pid)} —— {role}")
@@ -1251,4 +1282,10 @@ async def finish_game(channel, guild, game, result: dict):
 
     await _set_mute(guild, channel, False)
     await _cleanup_wolf_channel(game.channel_id)
-    await _say(channel, "\n".join(lines))
+    end_embed = game_embed(
+        title=banner,
+        description="\n".join(lines),
+        color=color,
+        footer=f"房间 #{game.channel_id}",
+    )
+    await _say(channel, embed=end_embed)

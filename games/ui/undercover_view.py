@@ -18,6 +18,9 @@ import discord
 from discord.ui import View, Select, Button, Modal, TextInput, select, button
 
 from src.chat.features.games.config.games_config import UNDERCOVER_VOTE_TIME, UNDERCOVER_DESC_TIME
+from src.chat.features.games.ui.embed_utils import (
+    game_embed, COLOR_PLAYING, COLOR_WIN, COLOR_LOSE, COLOR_DRAW, COLOR_MUTE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -44,39 +47,48 @@ async def _announce_tally(channel, guild, channel_id: int, result: dict):
     game = undercover_service.get_game(channel_id)
 
     vote_lines = [f"{_member_name(guild, tid)}：{cnt} 票" for tid, cnt in result.get("vote_count", {}).items()]
-    text = "🗳️ **投票结束！**\n" + ("\n".join(vote_lines) if vote_lines else "一票都没有……你们在干嘛。")
+    desc = "\n".join(vote_lines) if vote_lines else "一票都没有……你们在干嘛。"
+    title = "🗳️ 投票结束"
+    color = COLOR_PLAYING
     if result.get("forced"):
-        text = "⏰ 投票超时，按已有票数结算。\n" + text
+        title = "⏰ 投票超时"
+        desc = "按已有票数结算。\n" + desc
 
     if result.get("eliminated"):
-        text += f"\n{_member_name(guild, result['eliminated'])} 被淘汰出局。"
+        desc += f"\n{_member_name(guild, result['eliminated'])} 被淘汰出局。"
+        color = COLOR_LOSE
     elif result.get("tie"):
-        text += "\n🤝 平票！这不是 bug——按规则本轮无人淘汰，游戏继续。"
+        desc += "\n🤝 平票！这不是 bug——按规则本轮无人淘汰，游戏继续。"
+        color = COLOR_DRAW
     else:
-        text += "\n本轮无人淘汰。"
+        desc += "\n本轮无人淘汰。"
 
     if result.get("game_over"):
         names = ", ".join(_member_name(guild, uid) for uid in result["undercover_ids"])
         if result["winner"] == "civilian":
-            text += f"\n🎉 **平民胜利！** 卧底是：{names}"
+            desc += f"\n\n🎉 **平民胜利！** 卧底是：{names}"
+            color = COLOR_WIN
         else:
-            text += f"\n😈 **卧底胜利！** 卧底是：{names}"
+            desc += f"\n\n😈 **卧底胜利！** 卧底是：{names}"
             if result.get("max_rounds_reached"):
-                text += "（轮数用完还没抓出卧底）"
+                desc += "（轮数用完还没抓出卧底）"
+            color = COLOR_LOSE
         if game:
             settle = await undercover_service.settle(game, result["winner"], guild)
             if not settle.get("error"):
-                text += "\n结算完成，春春币/禁言已生效。"
+                desc += "\n结算完成，春春币/禁言已生效。"
+        embed = game_embed(title=title, description=desc, color=color, footer=f"房间 #{channel_id}")
         try:
-            await channel.send(text)
+            await channel.send(embed=embed)
         except Exception:
             log.exception("谁是卧底终局公告发送失败")
     else:
         next_round = result.get("next_round", 1)
-        text += f"\n\n**第{next_round}轮描述**开始，点下方按钮填写描述 👇"
+        desc += f"\n\n**第{next_round}轮描述**开始，点下方按钮填写描述 👇"
+        embed = game_embed(title=title, description=desc, color=color, footer=f"房间 #{channel_id}")
         desc_view = UndercoverDescView(channel_id, next_round)
         try:
-            desc_view.message = await channel.send(text, view=desc_view)
+            desc_view.message = await channel.send(embed=embed, view=desc_view)
         except Exception:
             log.exception("谁是卧底下一轮描述界面发送失败")
 
@@ -101,7 +113,13 @@ class UndercoverJoinView(View):
             c.disabled = True
         if self.message:
             try:
-                await self.message.edit(content="🎭 招募超时，这局卧底取消了。人齐了再开～", view=self)
+                timeout_embed = game_embed(
+                    title="🎭 招募超时",
+                    description="这局卧底取消了。人齐了再开～",
+                    color=COLOR_DRAW,
+                    footer=f"房间 #{self.channel_id}",
+                )
+                await self.message.edit(embed=timeout_embed, content=None, view=self)
             except discord.HTTPException:
                 pass
 
@@ -130,24 +148,29 @@ class UndercoverJoinView(View):
         # 【关键修复】先在 3 秒窗口内响应交互、把公屏切到描述界面，
         # 私信是慢操作（多人、可能限速），必须放到响应之后再做，
         # 否则交互令牌超时会导致这一步整体静默失败，公屏什么都不会变。
-        content = (
-            f"🎭 **谁是卧底开始！**\n"
+        start_desc = (
             f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
             f"私信正在发送中，收到词之前也可以先点「查看我的词」偷看。\n\n"
             f"**第{game.current_round}轮描述**\n"
             f"点下方按钮填写你的描述（只有你能看见的输入框），全员提交后统一展示！"
         )
+        start_embed = game_embed(
+            title="🎭 谁是卧底开始！",
+            description=start_desc,
+            color=COLOR_PLAYING,
+            footer=f"房间 #{self.channel_id}",
+        )
         desc_view = UndercoverDescView(self.channel_id, game.current_round)
 
         try:
-            await interaction.response.edit_message(content=content, view=desc_view)
+            await interaction.response.edit_message(embed=start_embed, content=None, view=desc_view)
             desc_view.message = await interaction.original_response()
         except Exception:
             log.exception("谁是卧底开局公屏更新失败，尝试频道直发兜底")
             channel = interaction.channel
             if channel is not None:
                 try:
-                    desc_view.message = await channel.send(content, view=desc_view)
+                    desc_view.message = await channel.send(embed=start_embed, view=desc_view)
                 except Exception:
                     log.exception("谁是卧底开局兜底发送也失败")
                     return
@@ -233,12 +256,16 @@ class UndercoverDescModal(Modal):
             game = undercover_service.get_game(self.channel_id)
             undercover_service.enter_voting(game)
             display = undercover_service.get_descriptions_for_display(game)
-            lines = [f"**第{self.round_num}轮描述展示**"]
-            for uid, d in display:
-                lines.append(f"**{_member_name(interaction.guild, uid)}**：{d}")
-            lines.append(f"\n全员已提交！进入投票环节（限时 {UNDERCOVER_VOTE_TIME} 秒），点下方按钮投票 👇")
+            lines = [f"**{_member_name(interaction.guild, uid)}**：{d}" for uid, d in display]
+            desc = "\n".join(lines) + f"\n\n全员已提交！进入投票环节（限时 {UNDERCOVER_VOTE_TIME} 秒），点下方按钮投票 👇"
             vote_view = UndercoverVoteEntryView(self.channel_id)
-            await interaction.response.send_message("\n".join(lines), view=vote_view)
+            embed = game_embed(
+                title=f"📝 第{self.round_num}轮描述展示",
+                description=desc,
+                color=COLOR_PLAYING,
+                footer=f"房间 #{self.channel_id}",
+            )
+            await interaction.response.send_message(embed=embed, view=vote_view)
             vote_view.message = await interaction.original_response()
         else:
             await interaction.response.send_message(

@@ -10,6 +10,8 @@
 import discord
 from discord.ui import View, Button, button
 
+from src.chat.features.games.ui.embed_utils import game_embed, COLOR_DRAW
+
 
 class RouletteView(View):
     def __init__(self, user_id: int, bet: int, is_life_gamble: bool, has_coins: bool):
@@ -30,7 +32,12 @@ class RouletteView(View):
             c.disabled = True
         if self.message:
             try:
-                await self.message.edit(content="🎡 轮盘等了你两分钟没等到，先收起来了。币没有变动。", view=self)
+                timeout_embed = game_embed(
+                    title="🎡 轮盘超时",
+                    description="轮盘等了你两分钟没等到，先收起来了。币没有变动。",
+                    color=COLOR_DRAW,
+                )
+                await self.message.edit(embed=timeout_embed, content=None, view=self)
             except discord.HTTPException:
                 pass
 
