@@ -289,7 +289,7 @@ WEREWOLF_ROLE_TABLE: dict[int, dict[str, int]] = {
 
 # 各阶段时限（秒）—— 快节奏
 WEREWOLF_NIGHT_ACTION_TIME = 30    # 每个夜晚角色的操作时限，超时视为不使用技能
-WEREWOLF_SPEAK_TIME = 30           # 单人发言时限，超时自动跳过
+WEREWOLF_SPEAK_TIME = 60           # 单人发言时限，超时自动跳过
 WEREWOLF_VOTE_TIME = 60            # 投票时限，超时按已有票强制计票
 WEREWOLF_HUNTER_SHOOT_TIME = 30    # 猎人开枪时限，超时视为不开枪
 WEREWOLF_JOIN_TIME = 180           # 招募时限，超时取消对局
@@ -305,14 +305,15 @@ WEREWOLF_IDIOT_KEEPS_VOTE = False         # 白痴翻牌后能否继续投票（
 
 WEREWOLF_ELECT_SHERIFF = True          # 是否启用警长竞选
 WEREWOLF_SHERIFF_VOTE_WEIGHT = 1.5     # 警长在白天放逐投票里的票权
-WEREWOLF_CAMPAIGN_SPEAK_TIME = 30      # 竞选发言单人时限（秒）
+WEREWOLF_CAMPAIGN_SPEAK_TIME = 60      # 竞选发言单人时限（秒）
 WEREWOLF_SHERIFF_VOTE_TIME = 60        # 警长投票时限（秒）
 WEREWOLF_SHERIFF_SIGNUP_TIME = 30      # 上警/不上警报名时限（秒）
 WEREWOLF_SHERIFF_TRANSFER_TIME = 30    # 警长死亡移交警徽时限（秒）
 
-# 讨论阶段禁言：填入普通玩家所属身份组 ID（int），None 则不禁言。
+# 公屏禁言：填入普通玩家所属身份组 ID（int），None 则不禁言。
+# 覆盖阶段：夜晚 + 警长竞选 + 白天讨论；投票和游戏结束时解禁。
 # 需要机器人身份组有「管理身份组」权限，且排在该身份组之上。
-WEREWOLF_MUTE_ROLE_ID: int | None = None
+WEREWOLF_MUTE_ROLE_ID: int | None = 1525913296090173500
 WEREWOLF_MUTE_DURING_DISCUSSION = True
 
 # 狼人私密频道：建在哪个分类（category）下；None 则建在触发频道同分类。

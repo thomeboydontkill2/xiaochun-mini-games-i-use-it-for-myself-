@@ -191,6 +191,8 @@ async def advance_night(channel, guild, channel_id: int):
     if game is None:
         return
     phase = game.phase
+    if phase.startswith("night_"):
+        await _set_mute(guild, channel, True)
     if phase == "night_guard":
         await _prompt_guard(channel, guild, game)
     elif phase == "night_wolf":
