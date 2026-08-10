@@ -37,6 +37,7 @@ class FakeCoinService:
         self.fail_add = False
         self.fail_add_users: set[int] = set()
         self.fail_remove = False
+        self.fail_remove_users: set[int] = set()
         self.log: list[tuple] = []
 
     async def get_balance(self, user_id: int):
@@ -49,7 +50,7 @@ class FakeCoinService:
         self.log.append(("add", user_id, amount, reason))
 
     async def remove_coins(self, user_id: int, amount: int, reason: str = ""):
-        if self.fail_remove:
+        if self.fail_remove or user_id in self.fail_remove_users:
             raise RuntimeError("remove_coins failed")
         self.balances[user_id] = self.balances.get(user_id, 0) - amount
         self.log.append(("remove", user_id, amount, reason))
@@ -86,6 +87,7 @@ def reset_stubs():
     fake_coin.fail_add = False
     fake_coin.fail_add_users.clear()
     fake_coin.fail_remove = False
+    fake_coin.fail_remove_users.clear()
     fake_guard.mutes.clear()
     from games.services import betting
     betting.life_limiter._counts.clear()

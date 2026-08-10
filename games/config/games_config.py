@@ -252,3 +252,51 @@ UNDERCOVER_MAX_ROUNDS = 6      # 最多描述轮数，用完卧底还没被抓�
 
 # 兼容旧名（现有 undercover_service 仍 import，等卧底组升级后删除）
 UNDERCOVER_DESC_ROUNDS = UNDERCOVER_MAX_ROUNDS
+
+# ===== 狼人杀（新增段落）=====
+
+WEREWOLF_MIN_PLAYERS = 6
+WEREWOLF_MAX_PLAYERS = 16
+WEREWOLF_DEFAULT_BET = 50          # 报名局费（春春币），胜方阵营平分败方下注池
+
+# 角色标识（内部用中文字符串，直接就是展示名）
+ROLE_WOLF = "狼人"
+ROLE_VILLAGER = "平民"
+ROLE_SEER = "预言家"
+ROLE_WITCH = "女巫"
+ROLE_HUNTER = "猎人"
+ROLE_GUARD = "守卫"
+ROLE_IDIOT = "白痴"
+
+# 神职（用于配比表可读性；平民不列，按剩余人数自动补齐）
+WEREWOLF_GOD_ROLES = (ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_GUARD, ROLE_IDIOT)
+
+# 按人数分配角色（不含平民，平民 = 总人数 - 表内数量之和）
+# 想调整板子只改这张表；改完跑 tests/test_werewolf.py 里的配比测试确认没有人数溢出。
+WEREWOLF_ROLE_TABLE: dict[int, dict[str, int]] = {
+    6:  {ROLE_WOLF: 2, ROLE_SEER: 1, ROLE_WITCH: 1},
+    7:  {ROLE_WOLF: 2, ROLE_SEER: 1, ROLE_WITCH: 1},
+    8:  {ROLE_WOLF: 2, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1},
+    9:  {ROLE_WOLF: 2, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1},
+    10: {ROLE_WOLF: 3, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1},
+    11: {ROLE_WOLF: 3, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1},
+    12: {ROLE_WOLF: 4, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1, ROLE_IDIOT: 1},
+    13: {ROLE_WOLF: 4, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1, ROLE_IDIOT: 1},
+    14: {ROLE_WOLF: 4, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1, ROLE_IDIOT: 1},
+    15: {ROLE_WOLF: 4, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1, ROLE_IDIOT: 1},
+    16: {ROLE_WOLF: 4, ROLE_SEER: 1, ROLE_WITCH: 1, ROLE_HUNTER: 1, ROLE_GUARD: 1, ROLE_IDIOT: 1},
+}
+
+# 各阶段时限（秒）—— 快节奏
+WEREWOLF_NIGHT_ACTION_TIME = 30    # 每个夜晚角色的操作时限，超时视为不使用技能
+WEREWOLF_SPEAK_TIME = 30           # 单人发言时限，超时自动跳过
+WEREWOLF_VOTE_TIME = 60            # 投票时限，超时按已有票强制计票
+WEREWOLF_HUNTER_SHOOT_TIME = 30    # 猎人开枪时限，超时视为不开枪
+WEREWOLF_JOIN_TIME = 180           # 招募时限，超时取消对局
+
+# 可调规则开关
+WEREWOLF_GUARD_SAME_TARGET_TWICE = False  # 守卫能否连续两晚守同一人（经典规则：不能）
+WEREWOLF_GUARD_CAN_PROTECT_SELF = True    # 守卫能否自守
+WEREWOLF_SAVE_AND_GUARD_KILLS = True      # 同守同救是否判死（True=经典"奶穿"，False=救活）
+WEREWOLF_TIE_ELIMINATES_NOBODY = True     # 投票平票是否不淘汰（True=直接入夜）
+WEREWOLF_IDIOT_KEEPS_VOTE = False         # 白痴翻牌后能否继续投票（经典：不能）
