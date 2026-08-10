@@ -11,8 +11,8 @@ MAX_BET = 1000
 DEFAULT_BET = 50
 
 # 赌命机制
-LIFE_GAMBLE_MUTE_MINUTES = 5          # 赌命输了：小春娘不理他时长（分钟）
-LIFE_GAMBLE_DOUBLE_MUTE_MINUTES = 5   # 双方都赌命：小春娘不理他时长（统一，不再翻倍）
+LIFE_GAMBLE_MUTE_MINUTES = 2          # 赌命输了：小春娘不理他时长（分钟）
+LIFE_GAMBLE_DOUBLE_MUTE_MINUTES = 2   # 双方都赌命：小春娘不理他时长（统一，不再翻倍）
 DISCORD_TIMEOUT_MINUTES = 1           # Discord 服务器真禁言时长（分钟），与上面叠加
 LIFE_GAMBLE_REWARD_MIN = 30           # 赌命赢了系统奖励最小币
 LIFE_GAMBLE_REWARD_MAX = 100          # 赌命赢了系统奖励最大币
@@ -35,7 +35,7 @@ ROULETTE_MULTIPLIERS = {
     10:   1,    # +900%：十倍
 }
 # 轮盘禁言档的禁言时长（分钟）
-ROULETTE_MUTE_MINUTES = 2
+ROULETTE_MUTE_MINUTES = 1
 
 # 对局兜底回收时长（秒）：超过这个时间没结束的对局自动清理，防止内存泄漏/频道被卡死
 GAME_TTL_SECONDS = 30 * 60
@@ -338,7 +338,7 @@ PRESSURE_ROULETTE_MAX_PLAYERS = 6
 PRESSURE_ROULETTE_DEFAULT_BET = 50          # 局费（春春币），败方每人扣这么多给胜方平分
 PRESSURE_ROULETTE_CHAMBER_SIZE = 6          # 弹巢容量
 PRESSURE_ROULETTE_INITIAL_LIVE = 1          # 开局装填实弹数
-PRESSURE_ROULETTE_BASE_STAKE = 3           # 基础赌注（分钟），中弹禁言时长下限
+PRESSURE_ROULETTE_BASE_STAKE = 1           # 基础赌注（分钟），中弹禁言时长下限
 PRESSURE_ROULETTE_PRESS_STAKE = 1           # 每加压 1 发子弹，赌注 +多少分钟
 PRESSURE_ROULETTE_JOIN_TIME = 180           # 招募时限（秒）
 PRESSURE_ROULETTE_TURN_TIME = 60            # 每回合操作时限（秒），超时自动开枪/传枪

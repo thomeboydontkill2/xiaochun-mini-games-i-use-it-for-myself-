@@ -123,7 +123,7 @@ def test_start_game_loads_chamber():
     assert game.phase == "fire"
     assert game.bullets == 1
     assert sum(game.chambers) == 1
-    assert game.current_stake() == 3  # BASE
+    assert game.current_stake() == 1  # BASE
 
 
 # ==================== 扣扳机 ====================
@@ -149,7 +149,7 @@ def test_shoot_self_hit_eliminates():
     assert result["hit"] is True
     assert 1000 in game.dead
     assert game.charge_for(1000) == 0  # 蓄力清零
-    assert result.get("mute_minutes") == 3
+    assert result.get("mute_minutes") == 1
 
 
 def test_shoot_not_your_turn():
@@ -202,8 +202,8 @@ def test_press_loads_bullets_and_increases_stake():
     result = pressure_roulette_service.handle_choice(CH, 1000, "load")
     assert result["action"] == "load"
     assert result["loaded"] == 3  # 1 + 蓄力2
-    # 赌注 = BASE(3) + pressure_bullets(3) = 6
-    assert game.current_stake() == 6
+    # 赌注 = BASE(1) + pressure_bullets(3) = 4
+    assert game.current_stake() == 4
     assert game.charge_for(1000) == 0  # 蓄力清零
     assert game.phase == "fire"
     # spin_cylinder 重洗了
@@ -216,7 +216,7 @@ def test_press_with_zero_streak_loads_one():
     pressure_roulette_service.shoot_self(CH, 1000)  # 空枪 → choice
     result = pressure_roulette_service.handle_choice(CH, 1000, "load")
     assert result["loaded"] == 1
-    assert game.current_stake() == 4  # 3 + 1
+    assert game.current_stake() == 2  # 1 + 1
 
 
 def test_press_not_your_turn():
@@ -375,7 +375,7 @@ def test_quit_during_fire():
     result = pressure_roulette_service.quit(CH, 1000)
     assert result["action"] == "quit"
     assert 1000 in game.dead
-    assert result["penalty_minutes"] >= 5
+    assert result["penalty_minutes"] >= 2
     assert len(game.cowards) == 1
 
 
@@ -490,8 +490,8 @@ def test_current_player_none_when_all_dead():
 
 def test_stake_accumulates_across_pressures():
     game = _make_game(players=3)
-    assert game.current_stake() == 3  # BASE
+    assert game.current_stake() == 1  # BASE
     game.pressure_bullets = 3
-    assert game.current_stake() == 6  # 3 + 3
+    assert game.current_stake() == 4  # 1 + 3
     game.pressure_bullets = 5
-    assert game.current_stake() == 8  # 3 + 5
+    assert game.current_stake() == 6  # 1 + 5

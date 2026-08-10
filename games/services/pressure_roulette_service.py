@@ -600,7 +600,7 @@ class PressureRouletteService:
 
         game.dead.append(user_id)
         stake_minutes = game.current_stake()
-        penalty_minutes = max(5, stake_minutes)  # 至少 5 分钟
+        penalty_minutes = max(2, stake_minutes)  # 至少 2 分钟
         game.cowards.append({
             "user_id": user_id, "stake_minutes": stake_minutes,
             "penalty_minutes": penalty_minutes,
