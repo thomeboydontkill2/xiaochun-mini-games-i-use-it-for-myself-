@@ -320,3 +320,25 @@ WEREWOLF_MUTE_DURING_DISCUSSION = True
 # 需要机器人有「管理频道」权限。创建失败会自动回退到私信投票模式。
 WEREWOLF_WOLF_CHANNEL_CATEGORY_ID: int | None = None
 WEREWOLF_USE_WOLF_CHANNEL = True
+
+
+# ===== 加压俄罗斯轮盘 =====
+#
+# 玩法：6 弹巢开局 1 发实弹，轮流对自己扣扳机。中弹 = 禁言（当前赌注分钟）+ 出局 + 扣局费。
+# 三选一：传枪（弹巢前进一格交下家）/ 再开一枪（攒连开蓄力）/ 加压（装 1+蓄力层数 发，赌注 +1 分钟/发）。
+# 子弹打光 = 游戏结束；只剩 1 人 → 冠军，多人 → 平局。
+# 败方平分给胜方（复用 werewolf settle 模式）。
+
+PRESSURE_ROULETTE_MIN_PLAYERS = 2
+PRESSURE_ROULETTE_MAX_PLAYERS = 6
+PRESSURE_ROULETTE_DEFAULT_BET = 50          # 局费（春春币），败方每人扣这么多给胜方平分
+PRESSURE_ROULETTE_CHAMBER_SIZE = 6          # 弹巢容量
+PRESSURE_ROULETTE_INITIAL_LIVE = 1          # 开局装填实弹数
+PRESSURE_ROULETTE_BASE_STAKE = 3           # 基础赌注（分钟），中弹禁言时长下限
+PRESSURE_ROULETTE_PRESS_STAKE = 1           # 每加压 1 发子弹，赌注 +多少分钟
+PRESSURE_ROULETTE_JOIN_TIME = 180           # 招募时限（秒）
+PRESSURE_ROULETTE_TURN_TIME = 60            # 每回合操作时限（秒），超时自动开枪
+
+# 中弹禁言用的身份组 ID；None 则不禁言（只扣局费）。
+# 复用狼人杀的普通玩家身份组即可。
+PRESSURE_ROULETTE_MUTE_ROLE_ID: int | None = 1525913296090173500
