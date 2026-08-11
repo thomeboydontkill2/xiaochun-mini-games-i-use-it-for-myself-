@@ -34,6 +34,10 @@ from src.chat.features.games.services import betting
 from src.chat.features.games.services.pressure_roulette_service import (
     pressure_roulette_service,
 )
+from src.chat.features.games.ui.embed_utils import (
+    game_embed, COLOR_PLAYING, COLOR_WIN, COLOR_LOSE, COLOR_MUTE,
+    COLOR_CHAMPION, COLOR_DRAW, COLOR_QUIT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -126,11 +130,12 @@ def _render_board(game, guild) -> str:
 
 
 class PressureRouletteJoinView(View):
-    def __init__(self, channel_id: int, bet: int, host_id: int):
+    def __init__(self, channel_id: int, bet: int, host_id: int, host_life: bool = False):
         super().__init__(timeout=PRESSURE_ROULETTE_JOIN_TIME)
         self.channel_id = channel_id
         self.bet = bet
         self.host_id = host_id
+        self.host_life = host_life
         self.started = False
         self.message: discord.Message | None = None
 
@@ -142,31 +147,46 @@ class PressureRouletteJoinView(View):
             c.disabled = True
         if self.message:
             try:
+                timeout_embed = game_embed(
+                    title="🔫 招募超时",
+                    description="这局加压轮盘取消了。人齐了再开～",
+                    color=COLOR_DRAW,
+                    footer=f"房间 #{self.channel_id}",
+                )
                 await self.message.edit(
-                    content="🔫 招募超时，这局加压轮盘取消了。人齐了再开～",
+                    embed=timeout_embed,
+                    content=None,
                     view=self,
                 )
             except discord.HTTPException:
                 pass
 
-    @button(label="加入", style=discord.ButtonStyle.success, emoji="🙋")
+    @button(label="加入（赌币）", style=discord.ButtonStyle.success, emoji="💰")
     async def join(self, interaction: discord.Interaction, button: Button):
+        await self._join(interaction, is_life=False)
+
+    @button(label="加入（赌命）", style=discord.ButtonStyle.danger, emoji="🔥")
+    async def join_life(self, interaction: discord.Interaction, button: Button):
+        await self._join(interaction, is_life=True)
+
+    async def _join(self, interaction: discord.Interaction, is_life: bool):
         try:
             bal = await betting.get_balance(interaction.user.id)
         except Exception:
             log.exception("加压轮盘查余额失败")
             bal = 0
-        if bal < self.bet:
+        if not is_life and bal < self.bet:
             await interaction.response.send_message(
-                f"你只有 {bal} 春春币，不够交 {self.bet} 的局费。", ephemeral=True)
+                f"你只有 {bal} 春春币，不够交 {self.bet} 的局费。试试赌命加入？", ephemeral=True)
             return
-        ok, msg = pressure_roulette_service.add_player(self.channel_id, interaction.user.id)
+        ok, msg = pressure_roulette_service.add_player(self.channel_id, interaction.user.id, is_life)
         if not ok:
             await interaction.response.send_message(msg, ephemeral=True)
             return
         game = pressure_roulette_service.get_game(self.channel_id)
+        mode = "赌命加入 🔥" if is_life else "赌币加入 💰"
         await interaction.response.send_message(
-            f"{interaction.user.mention} 上桌了 🙋（当前 {len(game.players)} 人）")
+            f"{interaction.user.mention} {mode}（当前 {len(game.players)} 人）")
 
     @button(label="退出", style=discord.ButtonStyle.secondary, emoji="🚪")
     async def leave(self, interaction: discord.Interaction, button: Button):
@@ -186,13 +206,21 @@ class PressureRouletteJoinView(View):
         for c in self.children:
             c.disabled = True
 
+        start_desc = (
+            f"共 {len(game.players)} 人\n"
+            f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
+            f"6 弹巢开局 1 发实弹，轮流对自己扣扳机。中弹 = 禁言 + 出局 + 扣局费。\n"
+            f"活下来后：传枪 / 再开一枪 / 加压 / 反手还击 / 抽弹 / 退出"
+        )
+        start_embed = game_embed(
+            title="🔫 加压俄罗斯轮盘开局！",
+            description=start_desc,
+            color=COLOR_PLAYING,
+            footer=f"房间 #{self.channel_id}",
+        )
         await interaction.response.edit_message(
-            content=(
-                f"🔫 **加压俄罗斯轮盘开局！** 共 {len(game.players)} 人\n"
-                f"参与：{', '.join(f'<@{p}>' for p in game.players)}\n"
-                f"6 弹巢开局 1 发实弹，轮流对自己扣扳机。中弹 = 禁言 + 出局 + 扣局费。\n"
-                f"活下来后：传枪 / 再开一枪 / 加压 / 反手还击 / 抽弹 / 退出"
-            ),
+            embed=start_embed,
+            content=None,
             view=None,
         )
         channel = interaction.channel
@@ -213,12 +241,13 @@ async def _post_fire(channel, guild, channel_id: int):
         return
     view = FireView(channel_id, cur, channel, guild)
     board = _render_board(game, guild)
-    view.message = await _say(
-        channel,
-        f"🔫 **第 {game.shot_number + 1} 枪**\n轮到 <@{cur}> 了。\n\n{board}\n\n"
-        f"⏳ {PRESSURE_ROULETTE_TURN_TIME} 秒内不动手，枪会自己响。",
-        view=view,
+    embed = game_embed(
+        title=f"🔫 第 {game.shot_number + 1} 枪",
+        description=f"轮到 <@{cur}> 了。\n\n{board}\n\n⏳ {PRESSURE_ROULETTE_TURN_TIME} 秒内不动手，枪会自己响。",
+        color=COLOR_PLAYING,
+        footer=f"房间 #{channel_id}",
     )
+    view.message = await _say(channel, embed=embed, view=view)
 
 
 class FireView(View):
@@ -328,18 +357,24 @@ async def _post_choice(channel, guild, channel_id: int):
     streak = game.charge_for(cur)
     load_bullets = game.load_bullets_for(cur)
     load_stake = game.current_stake() + load_bullets
-    msg = (
+    desc = (
         f"😮‍💨 空枪！<@{cur}> 撑过了这一枪，连开蓄力 {streak} 层。\n\n{board}\n\n"
-        f"选择：\n"
+        f"**选择：**\n"
         f"　🔫 传枪 — 弹巢前进一格，交给下一个人\n"
         f"　🔁 再开一枪 — 继续对自己开，攒蓄力（当前 {streak} 层）\n"
         f"　💥 加压 — 装 {load_bullets} 发，赌注涨到 {load_stake} 分钟\n"
     )
     if game.riposte_holder_id == cur and game.riposte_target_id:
         target = game.riposte_target_id
-        msg += f"　🔙 反手还击 — 把枪扔回给 <@{target}>（加压者）\n"
-    msg += f"\n⏳ {PRESSURE_ROULETTE_TURN_TIME} 秒内不动手，默认传枪。"
-    view.message = await _say(channel, msg, view=view)
+        desc += f"　🔙 反手还击 — 把枪扔回给 <@{target}>（加压者）\n"
+    desc += f"\n⏳ {PRESSURE_ROULETTE_TURN_TIME} 秒内不动手，默认传枪。"
+    embed = game_embed(
+        title="😮‍💨 空枪 — 选择",
+        description=desc,
+        color=COLOR_PLAYING,
+        footer=f"房间 #{channel_id}",
+    )
+    view.message = await _say(channel, embed=embed, view=view)
 
 
 class ChoiceView(View):
@@ -449,14 +484,14 @@ class ChoiceView(View):
 # ============================ 结果播报 ====================
 
 
-async def _say(channel, content: str, view: View | None = None):
+async def _say(channel, content: str = "", embed: discord.Embed | None = None, view: View | None = None):
     if channel is None:
         log.error("加压轮盘播报失败：没有频道对象")
         return None
     try:
-        return await channel.send(content, view=view)
+        return await channel.send(content=content or None, embed=embed, view=view)
     except Exception:
-        log.exception("加压轮盘公屏播报失败：%s", content[:80])
+        log.exception("加压轮盘公屏播报失败")
         return None
 
 
@@ -472,8 +507,21 @@ async def _announce(channel, guild, channel_id: int, result: dict):
     if action == "shoot" and result.get("hit"):
         victim = result["victim"]
         mute = result.get("mute_minutes", 0)
-        await _say(channel, f"💥 砰！\n<@{victim}> 已被消音 {mute} 分钟。\n原因：手气。")
-        await _apply_mute(guild, victim, mute)
+        if result.get("unload_shot"):
+            title = "🔧 抽弹中弹"
+            desc = f"<@{victim}> 抽掉 1 发后扣扳机，结果还是响了。\n已被消音 **{mute}** 分钟。\n原因：抽弹也救不了手气。"
+        else:
+            title = "💥 砰！"
+            desc = f"<@{victim}> 已被消音 **{mute}** 分钟。\n原因：手气。"
+        embed = game_embed(
+            title=title,
+            description=desc,
+            color=COLOR_LOSE,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
+        if not await _apply_mute(guild, victim, mute):
+            await _announce_mute_blocked(channel, victim, mute, channel_id)
         await _post_fire(channel, guild, channel_id)
         return
 
@@ -482,23 +530,52 @@ async def _announce(channel, guild, channel_id: int, result: dict):
         streak = result.get("streak", 0)
         riposte_stage = result.get("riposte_stage")
         if riposte_stage == "target":
-            await _say(channel, f"😮‍💨 空枪！加压者 <@{shooter}> 撑过了反手一枪，现在轮到发起人补枪。")
+            embed = game_embed(
+                title="😮‍💨 空枪",
+                description=f"加压者 <@{shooter}> 撑过了反手一枪，现在轮到发起人补枪。",
+                color=COLOR_PLAYING,
+                footer=f"房间 #{channel_id}",
+            )
+            await _say(channel, embed=embed)
             await _post_fire(channel, guild, channel_id)
         else:
-            await _say(channel, f"😮‍💨 空枪\n没响。\n枪：下次一定。")
+            embed = game_embed(
+                title="😮‍💨 空枪",
+                description="没响。\n枪：下次一定。",
+                color=COLOR_PLAYING,
+                footer=f"房间 #{channel_id}",
+            )
+            await _say(channel, embed=embed)
             await _post_choice(channel, guild, channel_id)
         return
 
     if action == "pass":
         by = result["by"]
-        nxt = result.get("next")
-        await _say(channel, f"🔫 <@{by}> 选择了传枪，弹巢前进一格，交给下一个人。")
+        if result.get("auto_pass_from_unload"):
+            title = "🔧 抽弹空枪 — 自动传枪"
+            desc = f"<@{by}> 抽掉 1 发后扣扳机，没响。\n按规则自动传枪，弹巢前进一格，交给下一个人。"
+        else:
+            title = "🔫 传枪"
+            desc = f"<@{by}> 选择了传枪，弹巢前进一格，交给下一个人。"
+        embed = game_embed(
+            title=title,
+            description=desc,
+            color=COLOR_PLAYING,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
         await _post_fire(channel, guild, channel_id)
         return
 
     if action == "again":
         by = result["by"]
-        await _say(channel, f"🔁 <@{by}> 选择再开一枪，继续对自己扣扳机。")
+        embed = game_embed(
+            title="🔁 再开一枪",
+            description=f"<@{by}> 选择再开一枪，继续对自己扣扳机。",
+            color=COLOR_PLAYING,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
         await _post_fire(channel, guild, channel_id)
         return
 
@@ -506,29 +583,53 @@ async def _announce(channel, guild, channel_id: int, result: dict):
         by = result["by"]
         loaded = result.get("loaded", 1)
         stake = result.get("stake_minutes", 0)
-        await _say(channel, f"💥 <@{by}> 加压了！装了 {loaded} 发子弹，赌注涨到 {stake} 分钟。")
+        embed = game_embed(
+            title="💥 加压！",
+            description=f"<@{by}> 加压了！装了 **{loaded}** 发子弹，赌注涨到 **{stake}** 分钟。",
+            color=COLOR_MUTE,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
         await _post_fire(channel, guild, channel_id)
         return
 
     if action == "riposte":
         by = result["by"]
         target = result.get("target")
-        await _say(channel, f"🔙 <@{by}> 反手还击！把枪扔回给 <@{target}>，加压者必须开一枪。")
+        embed = game_embed(
+            title="🔙 反手还击",
+            description=f"<@{by}> 反手还击！把枪扔回给 <@{target}>，加压者必须开一枪。",
+            color=COLOR_MUTE,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
         await _post_fire(channel, guild, channel_id)
         return
 
     if action == "quit":
         by = result["by"]
         penalty = result.get("penalty_minutes", 5)
-        await _say(channel, f"🤡 <@{by}> 选择了胆小鬼退出，名字将被挂上 🤡 {penalty} 分钟。")
-        await _apply_coward_penalty(guild, by, penalty)
+        embed = game_embed(
+            title="🤡 胆小鬼退出",
+            description=f"<@{by}> 选择了胆小鬼退出，名字将被挂上 🤡 **{penalty}** 分钟。",
+            color=COLOR_QUIT,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
+        if not await _apply_coward_penalty(guild, by, penalty):
+            await _announce_mute_blocked(channel, by, penalty, channel_id)
         await _post_fire(channel, guild, channel_id)
         return
 
     if action == "unload":
         by = result["by"]
-        await _say(channel, f"🔧 <@{by}> 抽弹开枪！卸掉 1 发，重转弹巢，立刻扣扳机。")
-        # 抽弹后 _perform_shot 的结果会走 _announce
+        embed = game_embed(
+            title="🔧 抽弹开枪",
+            description=f"<@{by}> 抽弹开枪！卸掉 1 发，重转弹巢，立刻扣扳机。",
+            color=COLOR_PLAYING,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
         return
 
 
@@ -541,61 +642,129 @@ async def _announce_end(channel, guild, channel_id: int, result: dict):
     if result.get("last_hit"):
         victim = result.get("last_victim")
         mute = result.get("mute_minutes", 0)
-        await _say(channel, f"💥 砰！\n<@{victim}> 已被消音 {mute} 分钟。\n原因：手气。")
-        await _apply_mute(guild, victim, mute)
+        if result.get("unload_shot"):
+            title = "🔧 抽弹中弹"
+            desc = f"<@{victim}> 抽掉 1 发后扣扳机，结果还是响了。\n已被消音 **{mute}** 分钟。\n原因：抽弹也救不了手气。"
+        else:
+            title = "💥 砰！"
+            desc = f"<@{victim}> 已被消音 **{mute}** 分钟。\n原因：手气。"
+        embed = game_embed(
+            title=title,
+            description=desc,
+            color=COLOR_LOSE,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
+        if victim is not None and not await _apply_mute(guild, victim, mute):
+            await _announce_mute_blocked(channel, victim, mute, channel_id)
     elif result.get("last_victim") is not None and not result.get("last_hit"):
         if result.get("action") == "quit":
             pass  # 退出已在 _announce 播报
         else:
-            await _say(channel, "😮‍💨 空枪\n没响。")
+            embed = game_embed(
+                title="😮‍💨 空枪",
+                description="没响。\n枪：下次一定。",
+                color=COLOR_PLAYING,
+                footer=f"房间 #{channel_id}",
+            )
+            await _say(channel, embed=embed)
 
     # 结局播报
     winner = result.get("winner")
     if winner is not None:
-        await _say(channel, f"🔫 子弹打光，游戏结束！\n🏆 冠军：<@{winner}>！零禁言。")
+        embed = game_embed(
+            title="🔫 游戏结束",
+            description=f"子弹打光，游戏结束！\n🏆 冠军：<@{winner}>！零禁言。",
+            color=COLOR_CHAMPION,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
     else:
         alive = result.get("alive", [])
         names = "、".join(f"<@{p}>" for p in alive)
-        await _say(channel, f"🔫 子弹打光，游戏结束！\n🤝 平局，谁也没赢。存活：{names}")
+        embed = game_embed(
+            title="🔫 游戏结束",
+            description=f"子弹打光，游戏结束！\n🤝 平局，谁也没赢。存活：{names}",
+            color=COLOR_DRAW,
+            footer=f"房间 #{channel_id}",
+        )
+        await _say(channel, embed=embed)
 
     # 结算
     settle = await pressure_roulette_service.settle(game)
     if settle.get("error"):
-        await _say(channel, "（结算已处理过，不重复扣派）")
+        await _say(channel, content="（结算已处理过，不重复扣派）")
     else:
         if settle.get("winner") is not None:
+            settle_lines = []
             share = settle.get("share", 0)
             if share > 0:
-                await _say(channel, f"💰 败方每人交 {game.bet} 币，冠军分得 **{share}** 春春币。")
+                settle_lines.append(f"赌币败方每人交 {game.bet} 币，赌币冠军分得 **{share}** 春春币。")
             else:
-                await _say(channel, "💰 败方局费没有扣到，本局不派彩。")
+                settle_lines.append("赌币败方局费没有扣到，本局不派彩。")
+            # 赌命胜方奖励
+            life_rewards = settle.get("life_rewards", {})
+            for pid, reward in life_rewards.items():
+                if reward > 0:
+                    settle_lines.append(f"赌命冠军 <@{pid}> 获得勇敢者奖励 **{reward}** 春春币！")
+                else:
+                    settle_lines.append(f"赌命冠军 <@{pid}> 今日赌命奖励已达上限，只赢了面子。")
+            embed = game_embed(
+                title="💰 结算",
+                description="\n".join(settle_lines),
+                color=COLOR_WIN if share > 0 or any(v > 0 for v in life_rewards.values()) else COLOR_DRAW,
+                footer=f"房间 #{channel_id}",
+            )
+            await _say(channel, embed=embed)
             if settle.get("deduct_failed"):
                 names = "、".join(f"<@{p}>" for p in settle["deduct_failed"])
-                await _say(channel, f"⚠️ {names} 局费扣款失败，已跳过。")
+                embed = game_embed(
+                    title="⚠️ 扣款失败",
+                    description=f"{names} 局费扣款失败，已跳过。",
+                    color=COLOR_MUTE,
+                    footer=f"房间 #{channel_id}",
+                )
+                await _say(channel, embed=embed)
 
 
-async def _apply_mute(guild, user_id: int, minutes: int):
+async def _announce_mute_blocked(channel, user_id: int, minutes: int, channel_id: int):
+    embed = game_embed(
+        title="🤯 神秘力量挡住了禁言",
+        description=(
+            f"<@{user_id}> 本该被禁言 **{minutes}** 分钟，"
+            "但由于神秘的力量，禁言似乎并未生效。\n"
+            "大概是管理员权限、身份组太高，或者小春娘的手还够不到那里。"
+        ),
+        color=COLOR_MUTE,
+        footer=f"房间 #{channel_id}",
+    )
+    await _say(channel, embed=embed)
+
+
+async def _apply_mute(guild, user_id: int, minutes: int) -> bool:
     """中弹禁言。"""
     if guild is None or minutes <= 0:
-        return
+        return True
     try:
         member = guild.get_member(user_id)
         if member is None:
-            return
+            return True
         await member.timeout(timedelta(minutes=minutes),
-                                 reason="加压轮盘中弹")
+                                  reason="加压轮盘中弹")
+        return True
     except Exception:
         log.exception("加压轮盘禁言失败（检查机器人「超时成员」权限）")
+        return False
 
 
-async def _apply_coward_penalty(guild, user_id: int, minutes: int):
+async def _apply_coward_penalty(guild, user_id: int, minutes: int) -> bool:
     """胆小鬼惩罚：改昵称挂🤡 + 禁言。"""
     if guild is None:
-        return
+        return True
     try:
         member = guild.get_member(user_id)
         if member is None:
-            return
+            return True
         # 改昵称
         old_nick = member.display_name
         if not old_nick.startswith("🤡"):
@@ -605,6 +774,8 @@ async def _apply_coward_penalty(guild, user_id: int, minutes: int):
                 log.warning("加压轮盘改昵称失败（检查机器人「管理昵称」权限）")
         # 禁言
         await member.timeout(timedelta(minutes=minutes),
-                                 reason="加压轮盘胆小鬼")
+                                  reason="加压轮盘胆小鬼")
+        return True
     except Exception:
         log.exception("加压轮盘胆小鬼惩罚失败")
+        return False

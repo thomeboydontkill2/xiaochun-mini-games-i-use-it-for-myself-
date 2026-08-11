@@ -383,7 +383,10 @@ class PressureRouletteService:
                 }
             if unload_shot:
                 # 抽弹活下来 → 强制传枪
-                return self._handle_choice_internal(game, "pass")
+                result = self._handle_choice_internal(game, "pass")
+                result["unload_shot"] = True
+                result["auto_pass_from_unload"] = True
+                return result
             game.phase = "choice"
             game.turn_token += 1
             return {
@@ -410,13 +413,17 @@ class PressureRouletteService:
 
         # 子弹打光检查
         if game.bullets <= 0:
-            return self._end_game(game, reason="bullets_empty",
-                                  last_victim=victim_id, hit=True)
+            result = self._end_game(game, reason="bullets_empty",
+                                    last_victim=victim_id, hit=True)
+            result["unload_shot"] = unload_shot
+            return result
         # 只剩 1 人
         alive = game.alive()
         if len(alive) <= 1:
-            return self._end_game(game, reason="last_man",
-                                  last_victim=victim_id, hit=True)
+            result = self._end_game(game, reason="last_man",
+                                    last_victim=victim_id, hit=True)
+            result["unload_shot"] = unload_shot
+            return result
 
         # 轮到下家
         alive = game.alive()
@@ -433,6 +440,7 @@ class PressureRouletteService:
             "stake_minutes": stake_minutes,
             "next": game.current_player(),
             "mute_minutes": stake_minutes,
+            "unload_shot": unload_shot,
             "game_over": False,
         }
 
